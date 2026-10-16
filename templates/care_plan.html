@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="{{ lang }}">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Nivara | AI Care Plan</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles/care_plan.css') }}" />
+    {% if paypal_configured %}
+    <script src="https://www.paypal.com/sdk/js?client-id={{ paypal_client_id }}&currency={{ paypal_currency }}&intent=capture&components=buttons"></script>
+    {% endif %}
+  </head>
+  <body>
+    <main class="shell">
+      <nav class="nav">
+        <a class="brand" href="{{ url_for('dashboard') }}"><img src="{{ url_for('static', filename='images/nivara-mark.svg') }}" alt="" /> NIVARA</a>
+        <div class="nav-meta"><span class="sandbox-dot"></span>{{ paypal_environment|upper }} · CARE COMMERCE</div>
+      </nav>
+
+      <section class="hero">
+        <div>
+          <p class="eyebrow">{% if lang == 'hi' %}एआई-समीक्षित केयर प्लान{% else %}AI-AUDITED CARE PLAN{% endif %} · {{ scan_filename }}</p>
+          <h1>{% if lang == 'hi' %}भुगतान से पहले<br /><em>सही</em> चुनाव करें।{% else %}Make the <em>informed</em> choice<br />before you pay.{% endif %}</h1>
+          <p class="lede">{% if lang == 'hi' %}आपके बिल विश्लेषण को समीक्षा योग्य, कम लागत वाले मेडिसिन प्लान में बदला गया है। आपकी मंज़ूरी के बिना कोई खरीद नहीं होगी।{% else %}Your bill analysis has been converted into a reviewable, lower-cost medicine plan. Nothing is purchased until you approve it.{% endif %}</p>
+        </div>
+        <div class="agent-card">
+          <div class="agent-top"><span>NIVARA AGENT</span><span class="live">● ANALYZED</span></div>
+          <p>{% if lang == 'hi' %}“मुझे <strong>{{ plan['items']|length }}</strong> उच्च-विश्वास मेडिसिन विकल्प मिले और <strong>₹{{ '%.2f'|format(plan.estimated_savings) }}</strong> तक की संभावित बचत मिली।”{% else %}“I found <strong>{{ plan['items']|length }}</strong> high-confidence medicine options and an estimated <strong>₹{{ '%.2f'|format(plan.estimated_savings) }}</strong> in potential savings.”{% endif %}</p>
+          <div class="agent-foot">{% if lang == 'hi' %}OCR + मूल्य इंटेलिजेंस + आपकी मंज़ूरी{% else %}Built from OCR + price intelligence + user approval{% endif %}</div>
+        </div>
+      </section>
+
+      {% if plan['items'] %}
+      <section class="grid">
+        <div class="plan-panel">
+          <div class="section-heading"><div><p class="eyebrow">01 · {% if lang == 'hi' %}समीक्षा{% else %}REVIEW{% endif %}</p><h2>{% if lang == 'hi' %}आपका सुझाया गया बास्केट{% else %}Your recommended basket{% endif %}</h2></div><span class="review-badge">{% if lang == 'hi' %}समीक्षा आवश्यक{% else %}REQUIRES REVIEW{% endif %}</span></div>
+          <div class="items">
+            {% for item in plan['items'] %}
+            <article class="medicine-row">
+              <div class="medicine-index">{{ '%02d'|format(loop.index) }}</div>
+              <div class="medicine-main"><h3>{{ item.name }}</h3><p>{{ item.reason }}</p><span class="confidence">{{ item.confidence|upper }} CONFIDENCE</span></div>
+              <div class="price-block"><span class="old-price">₹{{ '%.2f'|format(item.original_amount) }}</span><strong>₹{{ '%.2f'|format(item.recommended_amount) }}</strong><small>Save ₹{{ '%.2f'|format(item.savings) }}</small></div>
+            </article>
+            {% endfor %}
+          </div>
+          <div class="disclaimer"><span>!</span><p>{{ plan.disclaimer }}</p></div>
+        </div>
+
+        <aside class="checkout-panel">
+          <p class="eyebrow">02 · {% if lang == 'hi' %}विक्रेता चुनें{% else %}CHOOSE A MERCHANT{% endif %}</p>
+          <h2>{% if lang == 'hi' %}चुनें कि आपका प्लान कैसे पूरा हो।{% else %}Pick how your plan is fulfilled.{% endif %}</h2>
+          <div class="merchant-offers" role="radiogroup" aria-label="Demo merchant offers">
+            {% for offer in marketplace_offers %}
+            <label class="merchant-offer {% if offer.id == 'healthbridge' %}selected{% endif %}">
+              <input type="radio" name="merchant" value="{{ offer.id }}" data-total="{{ '%.2f'|format(offer.total) }}" data-name="{{ offer.name }}" {% if offer.id == 'healthbridge' %}checked{% endif %} />
+              <span class="merchant-dot {{ offer.accent }}"></span>
+              <span class="merchant-copy"><strong>{{ offer.name }}</strong><small>{{ offer.tagline }} · {{ offer.eta }}</small></span>
+              <span class="merchant-price">₹{{ '%.2f'|format(offer.total) }}</span>
+            </label>
+            {% endfor %}
+          </div>
+          <p class="merchant-disclaimer">{% if lang == 'hi' %}डेमो मर्चेंट मार्केटप्लेस। चेकआउट कॉन्फ़िगर किए गए PayPal Sandbox मर्चेंट द्वारा प्रोसेस किया जाता है—लाइव फार्मेसी द्वारा नहीं।{% else %}Demo merchant marketplace. Checkout is processed by the configured PayPal Sandbox merchant—not a live pharmacy.{% endif %}</p>
+          <p class="eyebrow">03 · {% if lang == 'hi' %}मंज़ूर करें और भुगतान करें{% else %}APPROVE & PAY{% endif %}</p>
+          <div class="price-line"><span>{% if lang == 'hi' %}मूल बिल मूल्य{% else %}Original bill value{% endif %}</span><span>₹{{ '%.2f'|format(plan.original_total) }}</span></div>
+          <div class="price-line savings"><span>{% if lang == 'hi' %}एआई द्वारा पहचानी बचत{% else %}AI-identified savings{% endif %}</span><span>− ₹{{ '%.2f'|format(plan.estimated_savings) }}</span></div>
+          <div class="total"><span>{% if lang == 'hi' %}चुना गया बास्केट{% else %}Selected basket{% endif %}</span><strong id="selected-total">₹{{ '%.2f'|format(plan.recommended_total) }}</strong></div>
+          <label class="consent"><input id="approval" type="checkbox" /><span>{% if lang == 'hi' %}मैंने इस प्लान की समीक्षा कर ली है। मैं समझता/समझती हूँ कि उपलब्धता और चिकित्सीय उपयुक्तता की पुष्टि एक योग्य प्रदाता से करनी होगी।{% else %}I reviewed this plan. I understand that I must verify availability and medical suitability with a qualified provider.{% endif %}</span></label>
+          {% if paypal_configured %}
+          <div id="paypal-button-container" class="paypal-container"></div>
+          <p id="payment-status" class="payment-status" role="status"></p>
+          {% else %}
+          <div class="setup-card"><strong>Sandbox setup needed</strong><p>Add <code>PAYPAL_CLIENT_ID</code> and <code>PAYPAL_CLIENT_SECRET</code> to your local <code>.env</code> file, then restart the app.</p></div>
+          {% endif %}
+          <p class="sandbox-note">{% if lang == 'hi' %}केवल Sandbox मोड। इस हैकाथॉन डेमो में कोई वास्तविक भुगतान नहीं होता।{% else %}Sandbox mode only. No real payment is processed in this hackathon demo.{% endif %}</p>
+        </aside>
+      </section>
+      {% else %}
+      <section class="empty-state"><p class="eyebrow">NOT ENOUGH VERIFIED DATA</p><h2>We need clearer bill information first.</h2><p>Return to the result and use a bill with at least one high- or medium-confidence medicine match to generate a checkout-ready plan.</p><a href="{{ url_for('result', scan_id=scan_id) }}">Return to analysis →</a></section>
+      {% endif %}
+
+      {% if payments %}
+      <section class="history"><p class="eyebrow">PAYMENT EVENT LOG</p><div class="history-list">{% for payment in payments %}<div><span>{{ payment.created_at }}</span><strong>{{ payment.status }}</strong><span>{{ payment.merchant_name or 'Demo merchant' }}</span><span>{{ payment.currency }} {{ '%.2f'|format(payment.amount) }}</span>{% if payment.capture_id %}<code>{{ payment.capture_id }}</code>{% endif %}</div>{% endfor %}</div></section>
+      {% endif %}
+      <footer><a href="{{ url_for('result', scan_id=scan_id) }}">← Back to bill evidence</a><span>NIVARA · USER-CONTROLLED AGENTIC COMMERCE</span></footer>
+    </main>
+    {% if paypal_configured and plan['items'] %}
+    <script>
+      const approval = document.getElementById('approval');
+      const status = document.getElementById('payment-status');
+      const csrfToken = "{{ csrf_token() }}";
+      const merchantInputs = [...document.querySelectorAll('input[name="merchant"]')];
+      const totalLabel = document.getElementById('selected-total');
+      function selectedMerchant() { return merchantInputs.find(input => input.checked); }
+      merchantInputs.forEach(input => input.addEventListener('change', () => {
+        document.querySelectorAll('.merchant-offer').forEach(card => card.classList.remove('selected'));
+        input.closest('.merchant-offer').classList.add('selected');
+        totalLabel.textContent = `₹${Number(input.dataset.total).toFixed(2)}`;
+      }));
+      const api = (suffix, data) => fetch(`/api/care-plan/{{ scan_id }}/${suffix}`, {
+        method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken}, body: JSON.stringify(data || {})
+      }).then(async response => { const body = await response.json(); if (!response.ok || !body.success) throw new Error(body.message || 'Something went wrong.'); return body; });
+      paypal.Buttons({
+        style: { layout: 'vertical', color: 'gold', shape: 'rect', label: 'pay' },
+        onClick: (data, actions) => { if (!approval.checked) { status.textContent = 'Please review and approve the care plan first.'; return actions.reject(); } if (!selectedMerchant()) { status.textContent = 'Choose a merchant offer first.'; return actions.reject(); } status.textContent = ''; return actions.resolve(); },
+        createOrder: () => api('paypal-order', {merchant_id: selectedMerchant().value}).then(order => order.id),
+        onApprove: data => { status.textContent = 'Capturing your sandbox payment…'; return api('paypal-capture', {orderID: data.orderID}).then(result => { status.className = 'payment-status success'; status.textContent = `${result.message} Your payment proof is recorded.`; }); },
+        onCancel: () => { status.textContent = 'Checkout cancelled. Your care plan is still available.'; },
+        onError: error => { status.textContent = error.message || 'PayPal checkout could not be completed.'; }
+      }).render('#paypal-button-container');
+    </script>
+    {% endif %}
+  </body>
+</html>

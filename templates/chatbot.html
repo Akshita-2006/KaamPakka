@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="{{ lang }}">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="csrf-token" content="{{ csrf_token() }}" />
+    <title>{{ _("Nivara - Care assistant") }}</title>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles/chatbot.css') }}" />
+    <style>
+      body { font-family: "Segoe UI", sans-serif; background:#f1f5f9; margin:0; padding:24px; }
+      #chatbox { width:100%; max-width:820px; margin:0 auto; background:white; border-radius:10px; box-shadow:0 5px 15px rgba(0,0,0,.1); padding:20px; }
+      .topbar { display:flex; align-items:center; justify-content:space-between; gap:1rem; flex-wrap:wrap; }
+      .message { margin-bottom:15px; line-height:1.5; white-space:pre-wrap; }
+      .user { text-align:right; color:#2563eb; }
+      .bot { text-align:left; color:#166534; }
+      #input-area { display:flex; gap:10px; margin-top:20px; }
+      #input-area input { flex:1; padding:12px; border-radius:6px; border:1px solid #cbd5e1; transition:border-color .2s ease, box-shadow .2s ease; }
+      #input-area input:focus { outline:none; border-color:#2563eb; box-shadow:0 0 0 3px rgba(37,99,235,.15); }
+      button, select { padding:10px 14px; border:0; border-radius:6px; cursor:pointer; transition:background .2s ease, transform .1s ease; }
+      button { background:#2563eb; color:white; }
+      button:hover { background:#1d4ed8; }
+      button:active { transform:translateY(1px); }
+      button:focus-visible, select:focus-visible, a:focus-visible {
+        outline:2px solid #1d4ed8; outline-offset:2px;
+      }
+      .secondary { background:#e2e8f0; color:#0f172a; }
+      .secondary:hover { background:#cbd5e1; }
+      .mode-buttons { display:flex; gap:10px; margin:15px 0; flex-wrap:wrap; align-items:center; }
+      .mode-btn { background:#e5e7eb; color:#111827; font-weight:600; }
+      .mode-btn:hover { background:#d1d5db; }
+      .mode-btn.selected { background:#2563eb; color:white; }
+      .mode-btn.selected:hover { background:#1d4ed8; }
+      .loading { color:#64748b; font-style:italic; }
+      .history { max-height:56vh; overflow-y:auto; padding:12px; border:1px solid #e5e7eb; border-radius:8px; background:#f8fafc; }
+      a { color:#2563eb; text-decoration:none; font-weight:600; }
+      a:hover { text-decoration:underline; }
+      #voiceLangSelect {
+        padding:9px 12px; border:1px solid #cbd5e1; border-radius:6px;
+        background:#f8fafc; color:#0f172a; font-size:0.9rem; cursor:pointer;
+        transition:border-color .2s ease;
+      }
+      #voiceLangSelect:focus { outline:none; border-color:#2563eb; }
+      .voice-hint { font-size:0.78rem; color:#64748b; margin-left:4px; }
+
+      @media (max-width: 600px) {
+        body { padding:12px; }
+        #chatbox { padding:14px; border-radius:8px; }
+        .topbar { flex-direction:column; align-items:flex-start; gap:.5rem; }
+        .mode-buttons { gap:6px; }
+        .history { max-height:50vh; padding:8px; }
+        #input-area { flex-direction:column; }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="chatbox">
+      <div class="topbar">
+        <h2>{% if lang == 'hi' %}आयु — आपका केयर को-पायलट{% else %}Ayu — your care co-pilot{% endif %}</h2>
+        <a href="/dashboard">{{ _("Back to Dashboard") }}</a>
+      </div>
+
+      <div class="mode-buttons">
+        <button class="mode-btn" type="button" onclick="setMode('price')">{{ _("Medicine Price") }}</button>
+        <button class="mode-btn selected" type="button" onclick="setMode('gemini')">{{ _("Ask AI") }}</button>
+        <button class="secondary" type="button" id="listenBtn">&#127908; {{ _("Listen") }}</button>
+        <button class="secondary" type="button" id="speakToggle">&#128266; {{ _("Speech On") }}</button>
+        <select id="voiceLangSelect" title="{{ _('Voice language for mic & speech') }}" aria-label="{{ _('Voice language for mic & speech') }}">
+          <option value="auto">&#127760; Auto</option>
+          <option value="en">&#127464;&#127475; English</option>
+          <option value="hi">&#127470;&#127475; Hindi</option>
+        </select>
+        <span class="voice-hint" id="voiceHint"></span>
+      </div>
+
+      <div id="messages" class="history">
+        <div class="message bot">{% if lang == 'hi' %}नमस्ते। मैं आपके बिल, दवाओं की कीमत और बेहतर केयर प्लान को समझने में मदद करूँगी।{% else %}Hi. I can help you understand a bill, compare medicine prices, and prepare for a clearer care plan.{% endif %}</div>
+        {% for item in history %}
+          <div class="message user">{{ item.user_message }}</div>
+          <div class="message bot">{{ item.bot_response }}</div>
+        {% endfor %}
+      </div>
+
+      <div id="input-area">
+        <input type="text" id="userInput" placeholder="{{ _('Type your message in English, Hindi, or Hinglish...') }}" />
+        <button type="button" onclick="sendMessage()">{{ _("Send") }}</button>
+      </div>
+    </div>
+
+    <script>
+      window.I18N = {
+        thinking: "{{ _('Thinking…') }}",
+        fallbackReply: "{{ _('Sorry, I could not understand that.') }}",
+        fallbackNote: "{{ _('Note: AI unavailable%%(reason)s — showing a fallback answer.') }}",
+        assistantUnavailable: "{{ _('Assistant is temporarily unavailable. Please try again.') }}",
+        noSpeechRecognition: "{{ _('Speech recognition is not supported in this browser.') }}",
+        listening: "{{ _('Listening…') }}",
+        listenLabel: "{{ _('Listen') }}",
+        couldNotHear: "{{ _('Could not hear clearly. Please try again.') }}",
+        speechOn: "{{ _('Speech On') }}",
+        speechOff: "{{ _('Speech Off') }}",
+        hindiVoice: "{{ _('Hindi voice: %%(name)s') }}",
+        noHindiVoice: "{{ _('No Hindi voice found — install from Windows Settings › Time & Language › Speech') }}"
+      };
+    </script>
+
+    <script>
+      const CSRF_TOKEN = document.querySelector('meta[name="csrf-token"]').content;
+      let selectedMode = "gemini";
+      let speechEnabled = true;
+      let currentLang = "{{ lang }}";   // updated after every AI reply
+      const messages    = document.getElementById("messages");
+      const input       = document.getElementById("userInput");
+      const listenBtn   = document.getElementById("listenBtn");
+      const speakToggle = document.getElementById("speakToggle");
+      const voiceSel    = document.getElementById("voiceLangSelect");
+      const voiceHint   = document.getElementById("voiceHint");
+
+      // ── voice list (loaded async in some browsers) ────────────────────
+      let voices = [];
+      function loadVoices() {
+        voices = window.speechSynthesis.getVoices();
+        updateVoiceHint();
+      }
+      if ("speechSynthesis" in window) {
+        loadVoices();
+        window.speechSynthesis.onvoiceschanged = loadVoices;
+      }
+
+      // Show which Hindi voice (if any) was found
+      function updateVoiceHint() {
+        const hv = _bestVoice("hindi");
+        if (hv) {
+          voiceHint.textContent = I18N.hindiVoice.replace("%(name)s", hv.name);
+          voiceHint.style.color = "#166534";
+        } else {
+          voiceHint.textContent = I18N.noHindiVoice;
+          voiceHint.style.color = "#b45309";
+        }
+      }
+
+      // Resolve which BCP-47 locale to use right now
+      function _activeLang() {
+        const sel = voiceSel.value;
+        if (sel === "hi") return "hi-IN";
+        if (sel === "en") return "en-IN";
+        // auto: derive from latest AI language
+        return (currentLang === "hindi" || currentLang === "hinglish") ? "hi-IN" : "en-IN";
+      }
+
+      // Try many common Hindi voice name variants across browsers / OS
+      const _HI_NAME_HINTS = [
+        "hindi", "lekha", "kalpana", "hemant", "googl", "microsoft hindi",
+        "रवि", "rashmi",
+      ];
+
+      function _bestVoice(lang) {
+        if (lang === "hindi" || lang === "hinglish") {
+          // 1. Exact BCP-47 match
+          let v = voices.find(v => v.lang === "hi-IN");
+          if (v) return v;
+          // 2. Starts with hi
+          v = voices.find(v => v.lang.startsWith("hi"));
+          if (v) return v;
+          // 3. Name hint match
+          v = voices.find(v => _HI_NAME_HINTS.some(h => v.name.toLowerCase().includes(h)));
+          if (v) return v;
+          return null;
+        }
+        // English
+        return voices.find(v => v.lang.startsWith("en")) || null;
+      }
+
+      // ── mode switcher ─────────────────────────────────────────────────
+      function setMode(mode) {
+        selectedMode = mode;
+        document.querySelectorAll(".mode-btn").forEach(b => b.classList.remove("selected"));
+        document.querySelector(`.mode-btn[onclick="setMode('${mode}')"]`).classList.add("selected");
+      }
+
+      // ── chat rendering ────────────────────────────────────────────────
+      function appendMessage(text, sender, extraClass = "") {
+        const msg = document.createElement("div");
+        msg.className = `message ${sender} ${extraClass}`.trim();
+        msg.innerText = text;
+        messages.appendChild(msg);
+        msg.scrollIntoView({ behavior: "smooth" });
+        return msg;
+      }
+
+      // ── TTS ───────────────────────────────────────────────────────────
+      function speak(text, language) {
+        if (!speechEnabled || !("speechSynthesis" in window)) return;
+        const utter  = new SpeechSynthesisUtterance(text);
+        utter.lang   = _activeLang();
+        const v = _bestVoice(language);
+        if (v) {
+          utter.voice = v;
+        } else if (language === "hindi" || language === "hinglish") {
+          // no Hindi voice installed — fallback to whatever the browser picks for hi-IN
+          utter.lang = "hi-IN";
+        }
+        utter.rate  = 0.92;
+        utter.pitch = 1.0;
+        window.speechSynthesis.cancel();
+        window.speechSynthesis.speak(utter);
+      }
+
+      // ── send message ──────────────────────────────────────────────────
+      async function sendMessage() {
+        const text = input.value.trim();
+        if (!text) return;
+        appendMessage(text, "user");
+        input.value = "";
+        const loading = appendMessage(I18N.thinking, "bot", "loading");
+        try {
+          const res  = await fetch("/chatbot/message", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-CSRFToken": CSRF_TOKEN },
+            body: JSON.stringify({ message: text, mode: selectedMode }),
+          });
+          const data = await res.json();
+          loading.remove();
+          const reply = data.reply || I18N.fallbackReply;
+          appendMessage(reply, "bot");
+          if (data.language) currentLang = data.language;
+          if (data.source === "fallback") {
+            const reason = data.error_reason ? ` (${data.error_reason})` : "";
+            appendMessage(I18N.fallbackNote.replace("%(reason)s", reason), "bot");
+          }
+          speak(reply, data.language || currentLang);
+        } catch {
+          loading.remove();
+          appendMessage(I18N.assistantUnavailable, "bot");
+        }
+      }
+
+      input.addEventListener("keydown", e => { if (e.key === "Enter") sendMessage(); });
+
+      // ── speech toggle ─────────────────────────────────────────────────
+      speakToggle.addEventListener("click", () => {
+        speechEnabled = !speechEnabled;
+        speakToggle.textContent = speechEnabled ? `🔊 ${I18N.speechOn}` : `🔇 ${I18N.speechOff}`;
+        if (!speechEnabled && "speechSynthesis" in window) window.speechSynthesis.cancel();
+      });
+
+      // ── STT: mic button ───────────────────────────────────────────────
+      listenBtn.addEventListener("click", () => {
+        const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SR) {
+          appendMessage(I18N.noSpeechRecognition, "bot");
+          return;
+        }
+        const recognition = new SR();
+        recognition.lang = _activeLang();   // respects the selector
+        recognition.interimResults = false;
+        recognition.maxAlternatives = 1;
+
+        listenBtn.textContent  = I18N.listening;
+        listenBtn.style.background = "#dc2626";
+        listenBtn.style.color      = "#fff";
+
+        const resetBtn = () => {
+          listenBtn.innerHTML    = `&#127908; ${I18N.listenLabel}`;
+          listenBtn.style.background = "";
+          listenBtn.style.color      = "";
+        };
+
+        recognition.onresult = e => {
+          input.value = e.results[0][0].transcript;
+          resetBtn();
+          sendMessage();
+        };
+        recognition.onerror = () => {
+          resetBtn();
+          appendMessage(I18N.couldNotHear, "bot");
+        };
+        recognition.onend = resetBtn;
+        recognition.start();
+      });
+
+      // Update hint whenever selector changes
+      voiceSel.addEventListener("change", updateVoiceHint);
+    </script>
+  </body>
+</html>

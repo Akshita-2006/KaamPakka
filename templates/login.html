@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="{{ lang }}">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="csrf-token" content="{{ csrf_token() }}" />
+    <title>{{ _("Nivara - Sign in") }}</title>
+    <link
+      href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link
+      rel="stylesheet"
+      href="{{ url_for('static', filename='styles/login.css') }}"
+    />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles/auth-refresh.css') }}" />
+  </head>
+  <body>
+    <div class="container">
+      <a class="auth-brand" href="{{ url_for('index') }}"><img src="{{ url_for('static', filename='images/nivara-mark.svg') }}" alt="" />NIVARA</a>
+      <div class="header">
+        <div class="title">
+          {{ _("Welcome Back") }}
+        </div>
+        <div class="subtitle">
+          {{ _("Sign in to your Nivara account") }}
+        </div>
+      </div>
+
+      <div id="formAlert" class="form-alert" role="alert" aria-live="polite" hidden></div>
+
+      <form class="login-form" id="loginForm" action="/login" method="POST">
+        <div class="form-group">
+          <label class="form-label" for="email">
+            {{ _("Email Address") }}
+          </label>
+          <div class="input-group">
+            <input
+              type="email"
+              id="email"
+              name="email"
+              class="form-input"
+              placeholder="{{ _('Enter your email') }}"
+              required
+              autocomplete="email"
+            />
+            <span class="input-icon">📧</span>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" for="password">
+            {{ _("Password") }}
+          </label>
+          <div class="input-group">
+            <input
+              type="password"
+              id="password"
+              name="password"
+              class="form-input"
+              placeholder="{{ _('Enter your password') }}"
+              required
+              autocomplete="current-password"
+            />
+            <button type="button" class="password-toggle" id="passwordToggle" aria-label="{{ _('Toggle password visibility') }}">
+              <span id="toggleIcon">👁️</span>
+            </button>
+          </div>
+          <div class="forgot-password">
+            <a href="#" id="forgotPassword">
+              {{ _("Forgot Password?") }}
+            </a>
+          </div>
+        </div>
+
+        <button class="btn-submit" type="submit" id="submitButton">
+          <span class="btn-text">
+            {{ _("LOGIN") }}
+          </span>
+          <div class="btn-spinner"></div>
+        </button>
+      </form>
+
+      <div class="alt-link">
+        {% trans %}Don't have an account?{% endtrans %}
+        <a href="/signup">{{ _("Create one here") }}</a>
+      </div>
+    </div>
+
+    <script>
+      window.I18N = {
+        invalidEmail: "{{ _('Please enter a valid email address') }}",
+        passwordTooShort: "{{ _('Password must be at least 6 characters') }}",
+        loginSuccessful: "{{ _('Login successful!') }}",
+        invalidCredentials: "{{ _('Invalid credentials!') }}",
+        errorOccurred: "{{ _('An error occurred. Please try again.') }}",
+        enterEmail: "{{ _('Please enter your email.') }}",
+        sendingOtp: "{{ _('Sending OTP…') }}",
+        networkError: "{{ _('Network error. Please try again.') }}",
+        enterOtp: "{{ _('Please enter the OTP.') }}",
+        verifying: "{{ _('Verifying…') }}",
+        passwordMin8: "{{ _('Password must be at least 8 characters.') }}",
+        passwordsDontMatch: "{{ _('Passwords do not match.') }}",
+        resetting: "{{ _('Resetting…') }}",
+        canNowLogin: "{{ _(' You can now log in.') }}"
+      };
+    </script>
+    <script src="{{ url_for('static', filename='scripts/form-utils.js') }}"></script>
+    <script src="{{ url_for('static', filename='scripts/forgot-password.js') }}"></script>
+    <script src="{{ url_for('static', filename='scripts/login.js') }}"></script>
+    {% if request.args.get('message') %}
+    <script>showFormAlert("{{ request.args.get('message') }}", "success");</script>
+    {% endif %}
+
+    <!-- Forgot-password 3-step modal -->
+    <div id="fpModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);
+         z-index:1000;align-items:center;justify-content:center;">
+      <div style="background:#fff;border-radius:12px;padding:2rem;width:90%;max-width:400px;position:relative;">
+        <button onclick="fpCloseModal()" style="position:absolute;top:.75rem;right:1rem;
+                background:none;border:none;font-size:1.4rem;cursor:pointer;color:#555;">&times;</button>
+        <h3 style="margin:0 0 1.25rem;">{{ _("Forgot Password") }}</h3>
+
+        <div id="fpStep1">
+          <p style="font-size:.9rem;color:#555;margin-bottom:1rem;">
+            {{ _("Enter your registered email — we'll send a 6-digit OTP.") }}
+          </p>
+          <input type="email" id="fpEmail" placeholder="{{ _('Email address') }}"
+                 style="width:100%;padding:.75rem;border:1px solid #e2e8f0;border-radius:6px;
+                        margin-bottom:.75rem;box-sizing:border-box;" />
+          <button onclick="fpSendOtp()"
+                  style="width:100%;padding:.75rem;background:#2563eb;color:#fff;
+                         border:none;border-radius:6px;cursor:pointer;font-size:1rem;">{{ _("Send OTP") }}</button>
+          <p id="fpMsg1" style="margin-top:.6rem;font-size:.85rem;"></p>
+        </div>
+
+        <div id="fpStep2" style="display:none;">
+          <p style="font-size:.9rem;color:#555;margin-bottom:1rem;">
+            {{ _("Enter the 6-digit OTP (valid 15 minutes).") }}
+          </p>
+          <input type="text" id="fpOtp" placeholder="{{ _('6-digit OTP') }}" maxlength="6" inputmode="numeric"
+                 style="width:100%;padding:.75rem;border:1px solid #e2e8f0;border-radius:6px;
+                        margin-bottom:.75rem;box-sizing:border-box;" />
+          <button onclick="fpVerifyOtp()"
+                  style="width:100%;padding:.75rem;background:#2563eb;color:#fff;
+                         border:none;border-radius:6px;cursor:pointer;font-size:1rem;">{{ _("Verify OTP") }}</button>
+          <p id="fpMsg2" style="margin-top:.6rem;font-size:.85rem;"></p>
+        </div>
+
+        <div id="fpStep3" style="display:none;">
+          <p style="font-size:.9rem;color:#047857;margin-bottom:1rem;">{{ _("OTP verified. Set your new password.") }}</p>
+          <input type="password" id="fpNewPass" placeholder="{{ _('New password (min 8 chars)') }}"
+                 style="width:100%;padding:.75rem;border:1px solid #e2e8f0;border-radius:6px;
+                        margin-bottom:.75rem;box-sizing:border-box;" />
+          <input type="password" id="fpConfPass" placeholder="{{ _('Confirm new password') }}"
+                 style="width:100%;padding:.75rem;border:1px solid #e2e8f0;border-radius:6px;
+                        margin-bottom:.75rem;box-sizing:border-box;" />
+          <button onclick="fpResetPassword()"
+                  style="width:100%;padding:.75rem;background:#2563eb;color:#fff;
+                         border:none;border-radius:6px;cursor:pointer;font-size:1rem;">{{ _("Reset Password") }}</button>
+          <p id="fpMsg3" style="margin-top:.6rem;font-size:.85rem;"></p>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

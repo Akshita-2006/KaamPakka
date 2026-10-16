@@ -1,0 +1,3452 @@
+import csv
+import io
+import json
+import logging
+import os
+import random
+import re
+import sqlite3
+import time
+import uuid
+import base64
+
+from datetime import datetime, timedelta
+from math import asin, cos, radians, sin, sqrt
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+from flask import Flask, Response, flash, jsonify, redirect, render_template, request, session, url_for
+from flask_babel import Babel, gettext as _
+from flask_wtf import CSRFProtect
+from werkzeug.middleware.proxy_fix import ProxyFix
+from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.utils import secure_filename
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*_args, **_kwargs):
+        return False
+
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None
+
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
+
+try:
+    import pypdfium2 as pdfium
+except ImportError:
+    pdfium = None
+
+try:
+    from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageStat, UnidentifiedImageError
+except ImportError:
+    Image = None
+
+    class UnidentifiedImageError(Exception):
+        pass
+
+try:
+    from rapidfuzz import fuzz
+except ImportError:
+    from difflib import SequenceMatcher
+
+    class _FuzzFallback:
+        @staticmethod
+        def token_set_ratio(a, b):
+            return int(SequenceMatcher(None, a, b).ratio() * 100)
+
+        @staticmethod
+        def partial_ratio(a, b):
+            return int(SequenceMatcher(None, a, b).ratio() * 100)
+
+        @staticmethod
+        def ratio(a, b):
+            return int(SequenceMatcher(None, a, b).ratio() * 100)
+
+    fuzz = _FuzzFallback()
+
+try:
+    from google import genai
+    from google.genai import types as genai_types
+except ImportError:
+    genai = None
+    genai_types = None
+
+try:
+    import easyocr as _easyocr_module
+    _easyocr_cache: dict = {}
+except ImportError:
+    _easyocr_module = None
+    _easyocr_cache: dict = {}
+
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors as _rl_colors
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    _reportlab_available = True
+except ImportError:
+    _reportlab_available = False
+
+
+BASE_DIR = Path(__file__).resolve().parent
+DATABASE = Path(os.getenv("DATABASE_PATH", BASE_DIR / "users.db"))
+CSV_FILE = BASE_DIR / "products.csv"
+UPLOAD_FOLDER = BASE_DIR / "uploads"
+UPLOAD_FOLDER.mkdir(exist_ok=True)
+
+load_dotenv(BASE_DIR / ".env")
+
+_loaded_key = os.getenv("GOOGLE_API_KEY", "")
+if _loaded_key:
+    print(f"GOOGLE_API_KEY loaded: {_loaded_key[:4]}...{_loaded_key[-4:]} (len={len(_loaded_key)})")
+else:
+    print("GOOGLE_API_KEY loaded: NOT SET")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
+app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+_DEV_SECRET_KEY = "dev-only-change-me"
+app.secret_key = os.getenv("SECRET_KEY", _DEV_SECRET_KEY)
+if app.secret_key == _DEV_SECRET_KEY:
+    logging.warning(
+        "SECRET_KEY is not set — falling back to an insecure default. "
+        "Set SECRET_KEY in the environment before deploying to production."
+    )
+
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=bool(os.getenv("RENDER")),
+    PERMANENT_SESSION_LIFETIME=timedelta(days=7),
+    MAX_CONTENT_LENGTH=16 * 1024 * 1024,
+    BABEL_DEFAULT_LOCALE="en",
+    BABEL_TRANSLATION_DIRECTORIES=str(BASE_DIR / "translations"),
+)
+
+csrf = CSRFProtect(app)
+
+SUPPORTED_LOCALES = ("en", "hi")
+
+
+def normalize_locale(value):
+    """Map legacy language names and raw locale codes to a supported Babel locale."""
+    mapping = {
+        "english": "en", "hindi": "hi", "hinglish": "hi",
+        "en": "en", "hi": "hi",
+    }
+    return mapping.get((value or "").strip().lower(), "en")
+
+
+def get_locale():
+    if "language" in session:
+        return normalize_locale(session["language"])
+    return request.accept_languages.best_match(SUPPORTED_LOCALES) or "en"
+
+
+babel = Babel(app, locale_selector=get_locale)
+
+# ── Simple in-process rate limiter ────────────────────────────────────────────
+_rate_limit_store: dict = {}
+_pending_scan_store: dict = {}
+
+def check_rate_limit(key: str, max_requests: int = 5, window_sec: int = 60) -> bool:
+    """Return True if the request is allowed, False if rate-limited."""
+    now = time.time()
+    hits = [t for t in _rate_limit_store.get(key, []) if now - t < window_sec]
+    if len(hits) >= max_requests:
+        return False
+    _rate_limit_store[key] = hits + [now]
+    return True
+
+# ── Allowed upload extensions ─────────────────────────────────────────────────
+_ALLOWED_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp", ".pdf"})
+
+_gemini_client = None
+_paypal_access_token = None
+_paypal_access_token_expires_at = 0
+
+
+def paypal_config():
+    """Return the active PayPal configuration without ever exposing the secret."""
+    environment = (os.getenv("PAYPAL_ENV", "sandbox") or "sandbox").lower()
+    environment = environment if environment in {"sandbox", "live"} else "sandbox"
+    return {
+        "environment": environment,
+        "client_id": os.getenv("PAYPAL_CLIENT_ID", "").strip(),
+        "client_secret": os.getenv("PAYPAL_CLIENT_SECRET", "").strip(),
+        "currency": (os.getenv("PAYPAL_CURRENCY", "INR") or "INR").upper(),
+        "api_base": "https://api-m.paypal.com" if environment == "live" else "https://api-m.sandbox.paypal.com",
+    }
+
+
+def paypal_is_configured():
+    config = paypal_config()
+    return bool(config["client_id"] and config["client_secret"])
+
+
+def _paypal_json_request(method, path, payload=None, access_token=None):
+    """Make a small, dependency-free PayPal REST request and return decoded JSON."""
+    config = paypal_config()
+    url = f"{config['api_base']}{path}"
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+    request_id = uuid.uuid4().hex
+    headers["PayPal-Request-Id"] = request_id
+    request_obj = Request(url, data=data, headers=headers, method=method)
+    try:
+        with urlopen(request_obj, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        app.logger.warning("PayPal API %s %s failed: %s", method, path, body[:800])
+        try:
+            detail = json.loads(body)
+            message = detail.get("message") or "PayPal could not process this request."
+        except json.JSONDecodeError:
+            message = "PayPal could not process this request."
+        raise RuntimeError(message) from exc
+    except URLError as exc:
+        app.logger.warning("PayPal connection failed: %s", exc)
+        raise RuntimeError("Could not reach PayPal. Please try again.") from exc
+
+
+def get_paypal_access_token():
+    global _paypal_access_token, _paypal_access_token_expires_at
+    if _paypal_access_token and time.time() < _paypal_access_token_expires_at:
+        return _paypal_access_token
+    config = paypal_config()
+    if not paypal_is_configured():
+        raise RuntimeError("PayPal Sandbox is not configured yet.")
+    credentials = base64.b64encode(
+        f"{config['client_id']}:{config['client_secret']}".encode("utf-8")
+    ).decode("ascii")
+    request_obj = Request(
+        f"{config['api_base']}/v1/oauth2/token",
+        data=b"grant_type=client_credentials",
+        headers={
+            "Accept": "application/json",
+            "Accept-Language": "en_US",
+            "Authorization": f"Basic {credentials}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request_obj, timeout=20) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError) as exc:
+        app.logger.warning("PayPal OAuth failed: %s", exc)
+        raise RuntimeError("PayPal authentication failed. Check the Sandbox credentials.") from exc
+    token = result.get("access_token")
+    if not token:
+        raise RuntimeError("PayPal did not return an access token.")
+    _paypal_access_token = token
+    _paypal_access_token_expires_at = time.time() + max(int(result.get("expires_in", 300)) - 60, 60)
+    return token
+
+
+def get_gemini_client():
+    """Lazily build and cache the google-genai Client. Raises with the exact reason on failure."""
+    global _gemini_client
+    if _gemini_client is not None:
+        return _gemini_client
+    if genai is None:
+        raise RuntimeError("google-genai is not installed")
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("GOOGLE_API_KEY is not configured")
+    if not (api_key.startswith("AIza") or api_key.startswith("AQ.")):
+        raise RuntimeError(
+            f"GOOGLE_API_KEY does not look like a Gemini API key (got prefix '{api_key[:4]}...'). "
+            "Valid keys start with 'AIza' (legacy Standard key) or 'AQ.' (current Auth key). "
+            "Generate one at https://aistudio.google.com/apikey"
+        )
+    _gemini_client = genai.Client(api_key=api_key)
+    return _gemini_client
+
+
+tesseract_path = os.getenv("TESSERACT_CMD")
+if pytesseract and tesseract_path:
+    pytesseract.pytesseract.tesseract_cmd = tesseract_path
+elif pytesseract and os.name == "nt":
+    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+
+HINGLISH_HINTS = {
+    "dawa", "dawai", "bimari", "aspataal", "hospital", "kitna", "hai", "kya",
+    "bill", "mahanga", "sasta", "madad", "doctor", "ilaaj", "yojana"
+}
+AYUSHMAN_HINTS = (
+    "ayushman", "pmjay", "pm-jay", "jan arogya", "janaushadhi", "government",
+    "govt", "public", "trust", "charitable", "nha"
+)
+PMJAY_ELIGIBILITY_URL = "https://beneficiary.nha.gov.in/"
+PMJAY_HOSPITAL_SEARCH_URL = "https://hospitals.pmjay.gov.in/Search/"
+MOHFW_URL = "https://www.mohfw.gov.in/"
+GOOGLE_MAPS_HOSPITAL_SEARCH_URL = "https://www.google.com/maps/search/hospitals/@{lat},{lon},14z"
+OSM_HOSPITAL_SEARCH_URL = "https://www.openstreetmap.org/search?query=hospital#map=14/{lat}/{lon}"
+
+
+def get_db_connection():
+    conn = sqlite3.connect(DATABASE, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def column_exists(conn, table, column):
+    return any(row["name"] == column for row in conn.execute(f"PRAGMA table_info({table})"))
+
+
+def init_db():
+    DATABASE.parent.mkdir(parents=True, exist_ok=True)
+    with get_db_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                first_name TEXT NOT NULL,
+                last_name TEXT NOT NULL,
+                username TEXT NOT NULL UNIQUE,
+                email TEXT NOT NULL UNIQUE,
+                password TEXT NOT NULL,
+                preferred_language TEXT DEFAULT 'en',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS scans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                filename TEXT NOT NULL,
+                text TEXT,
+                flagged TEXT DEFAULT '{}',
+                report TEXT DEFAULT '{}',
+                illness TEXT,
+                covered TEXT,
+                savings REAL DEFAULT 0,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS otp_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL,
+                otp TEXT NOT NULL,
+                purpose TEXT DEFAULT 'forgot_password',
+                used INTEGER DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(email, otp, purpose)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                user_message TEXT NOT NULL,
+                bot_response TEXT NOT NULL,
+                language TEXT DEFAULT 'english',
+                mode TEXT DEFAULT 'gemini',
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS payment_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                scan_id INTEGER NOT NULL,
+                paypal_order_id TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'CREATED',
+                amount REAL NOT NULL,
+                currency TEXT NOT NULL,
+                plan_json TEXT NOT NULL,
+                merchant_id TEXT,
+                merchant_name TEXT,
+                capture_id TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (scan_id) REFERENCES scans(id) ON DELETE CASCADE
+            )
+        """)
+
+        migrations = {
+            "users": {
+                "preferred_language": "ALTER TABLE users ADD COLUMN preferred_language TEXT DEFAULT 'en'",
+                "created_at": "ALTER TABLE users ADD COLUMN created_at DATETIME",
+                "state": "ALTER TABLE users ADD COLUMN state TEXT",
+                "caste_category": "ALTER TABLE users ADD COLUMN caste_category TEXT DEFAULT 'general'",
+                "annual_income": "ALTER TABLE users ADD COLUMN annual_income TEXT DEFAULT 'not_specified'",
+            },
+            "scans": {
+                "illness": "ALTER TABLE scans ADD COLUMN illness TEXT",
+                "covered": "ALTER TABLE scans ADD COLUMN covered TEXT",
+                "report": "ALTER TABLE scans ADD COLUMN report TEXT DEFAULT '{}'",
+                "savings": "ALTER TABLE scans ADD COLUMN savings REAL DEFAULT 0",
+            },
+            "otp_tokens": {
+                "purpose": "ALTER TABLE otp_tokens ADD COLUMN purpose TEXT DEFAULT 'forgot_password'",
+                "used": "ALTER TABLE otp_tokens ADD COLUMN used INTEGER DEFAULT 0",
+            },
+            "payment_orders": {
+                "merchant_id": "ALTER TABLE payment_orders ADD COLUMN merchant_id TEXT",
+                "merchant_name": "ALTER TABLE payment_orders ADD COLUMN merchant_name TEXT",
+            },
+        }
+        for table, columns in migrations.items():
+            for column, statement in columns.items():
+                if not column_exists(conn, table, column):
+                    conn.execute(statement)
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_scans_user_timestamp ON scans(user_id, timestamp DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_user_timestamp ON chat_history(user_id, timestamp DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_otp_email_purpose ON otp_tokens(email, purpose, used)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_payment_orders_user_scan ON payment_orders(user_id, scan_id, created_at DESC)")
+
+        # Normalize legacy preferred_language values ('english'/'hindi'/'hinglish') to Babel locale codes.
+        conn.execute("UPDATE users SET preferred_language = 'en' WHERE preferred_language = 'english'")
+        conn.execute("UPDATE users SET preferred_language = 'hi' WHERE preferred_language IN ('hindi', 'hinglish')")
+        conn.execute("UPDATE users SET preferred_language = 'en' WHERE preferred_language NOT IN ('en', 'hi')")
+        conn.commit()
+
+
+def build_care_plan(report):
+    """Turn existing bill analysis into a conservative, user-reviewable care basket."""
+    eligible_items = []
+    for item in report.get("detected_items", []):
+        if item.get("confidence_tier") == "low":
+            continue
+        try:
+            original = float(item.get("line_total") or 0)
+            recommended = float(item.get("expected_line_total") or 0)
+        except (TypeError, ValueError):
+            continue
+        if original <= 0 or recommended <= 0:
+            continue
+        eligible_items.append({
+            "name": str(item.get("name") or "Medicine")[:120],
+            "quantity": max(1, min(int(float(item.get("quantity") or 1)), 99)),
+            "original_amount": round(original, 2),
+            "recommended_amount": round(recommended, 2),
+            "savings": round(max(original - recommended, 0), 2),
+            "confidence": item.get("confidence_tier", "medium"),
+            "reason": str(item.get("jan_aushadhi_note") or "Reference-priced medicine option")[:240],
+        })
+    total_original = round(sum(item["original_amount"] for item in eligible_items), 2)
+    total_recommended = round(sum(item["recommended_amount"] for item in eligible_items), 2)
+    return {
+        "items": eligible_items[:10],
+        "original_total": total_original,
+        "recommended_total": total_recommended,
+        "estimated_savings": round(max(total_original - total_recommended, 0), 2),
+        "requires_review": True,
+        "disclaimer": (
+            "This is a price-comparison plan, not a prescription or medical recommendation. "
+            "Confirm availability, substitution suitability, and final price with a licensed provider before paying."
+        ),
+    }
+
+
+# Demo merchants are deliberately local application data: they make the prototype's
+# marketplace decision visible without pretending that an un-onboarded pharmacy is real.
+DEMO_MERCHANTS = (
+    {"id": "healthbridge", "name": "HealthBridge Pharmacy", "tagline": "Best balance", "eta": "45–60 min", "multiplier": 1.00, "accent": "balance"},
+    {"id": "carecart", "name": "CareCart Wellness", "tagline": "Fastest delivery", "eta": "20–30 min", "multiplier": 1.06, "accent": "fast"},
+    {"id": "jancare", "name": "JanCare Direct", "tagline": "Lowest basket", "eta": "75–90 min", "multiplier": 0.94, "accent": "value"},
+)
+
+
+def build_marketplace_offers(plan):
+    """Produce transparent, deterministic demo offers for an AI-reviewed basket."""
+    offers = []
+    for merchant in DEMO_MERCHANTS:
+        item_total = sum(
+            round(float(item["recommended_amount"]) * merchant["multiplier"], 2)
+            for item in plan.get("items", [])
+        )
+        total = round(item_total, 2)
+        offers.append({
+            **merchant,
+            "total": total,
+            "savings_vs_bill": round(max(plan.get("original_total", 0) - total, 0), 2),
+            "reason": (
+                "Recommended for the best price-to-speed balance."
+                if merchant["id"] == "healthbridge" else
+                "Recommended when getting the basket sooner matters most."
+                if merchant["id"] == "carecart" else
+                "Recommended when minimizing the medicine basket total matters most."
+            ),
+            "demo": True,
+        })
+    return sorted(offers, key=lambda offer: offer["total"])
+
+
+def get_marketplace_offer(plan, merchant_id):
+    offers = build_marketplace_offers(plan)
+    return next((offer for offer in offers if offer["id"] == merchant_id), None)
+
+
+def translate_category(code):
+    labels = {
+        "lab_test": _("Lab Test"),
+        "consultation": _("Consultation"),
+        "room_charge": _("Room Charge"),
+        "procedure": _("Procedure"),
+        "gst": _("GST"),
+        "medicine": _("Medicine"),
+    }
+    return labels.get((code or "").lower(), (code or "").replace("_", " ").title())
+
+
+def translate_confidence(tier):
+    labels = {
+        "low": _("Low"),
+        "medium": _("Medium"),
+        "high": _("High"),
+    }
+    return labels.get((tier or "").lower(), (tier or "").capitalize())
+
+
+@app.context_processor
+def inject_language():
+    return {
+        "lang": get_locale(),
+        "translate_category": translate_category,
+        "translate_confidence": translate_confidence,
+    }
+
+
+def detect_language(text: str) -> str:
+    """Detect message language; respects the user's stored preference for roman-script input."""
+    if re.search(r"[\u0900-\u097F]", text or ""):
+        return "hindi"
+    # session["language"] holds a Babel locale code ('en'/'hi'); map back to the
+    # AI-chat-language vocabulary ("english"/"hindi"/"hinglish") this function returns.
+    preferred = "hindi" if normalize_locale(session.get("language")) == "hi" else "english"
+    words = set(re.findall(r"[a-zA-Z]+", (text or "").lower()))
+    if words & HINGLISH_HINTS:
+        return "hinglish"
+    # If the user has chosen Hindi, keep it \u2014 they may type in Roman script.
+    if preferred == "hindi" and words:
+        return preferred
+    return preferred
+
+
+def translate_reply(text, language):
+    if language == "hindi":
+        return text
+    if language == "hinglish":
+        return text.replace("medicine", "dawai").replace("hospital", "hospital").replace("bill", "bill")
+    return text
+
+
+def preprocess(text):
+    text = (text or "").lower()
+    text = re.sub(r"[^a-z0-9\s./-]", " ", text)
+    for word in ["ip", "bp", "usp", "tablet", "tablets", "tab", "capsule", "capsules", "cap", "syrup", "injection"]:
+        text = re.sub(rf"\b{word}\b", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_mg(text):
+    match = re.search(r"(\d+(?:\.\d+)?)\s*mg", (text or "").lower())
+    return float(match.group(1)) if match else None
+
+
+def extract_dosage_form(text):
+    match = re.search(
+        r"\b(tablets?|capsules?|injections?|suspensions?|syrups?|creams?|gels?|ointments?|drops?|vials?)\b",
+        (text or "").lower(),
+    )
+    if not match:
+        return ""
+    form = match.group(1)
+    return {
+        "tablet": "tablets", "capsule": "capsules", "injection": "injections",
+        "suspension": "suspensions", "syrup": "syrups", "cream": "creams",
+        "gel": "gels", "ointment": "ointments", "drop": "drops", "vial": "vials",
+    }.get(form, form)
+
+
+def extract_primary_name(text):
+    without_item_number = re.sub(r"^\s*\d+[.)-]?\s+", "", text or "")
+    match = re.search(r"[a-zA-Z][a-zA-Z-]{2,}", without_item_number)
+    return match.group(0).lower() if match else ""
+
+
+def extract_price_info(line):
+    rupee_values = re.findall(r"(?:rs\.?|inr|₹)\s*(\d+(?:\.\d{1,2})?)", line, flags=re.I)
+    if rupee_values:
+        return float(rupee_values[-1]), "detected_price"
+
+    amount_match = re.search(r"(\d+(?:\.\d{1,2})?)\s*$", line or "")
+    if not amount_match:
+        return None, "not_found"
+
+    amount = float(amount_match.group(1))
+    prefix = line[:amount_match.start()].rstrip()
+    quantity_match = re.search(r"(?:^|\s)(\d{1,3})\s*$", prefix)
+    if quantity_match:
+        quantity = int(quantity_match.group(1))
+        if 0 < quantity <= 100:
+            return round(amount / quantity, 2), "calculated_unit_price"
+    return amount, "detected_price"
+
+
+def extract_billing_info(line):
+    text = line or ""
+    explicit_quantity = re.search(r"\bqty\.?\s*[:=-]?\s*(\d{1,3})\b", text, flags=re.I)
+
+    # Remove strengths and pack sizes before looking for quantity and total.
+    pricing_text = re.sub(r"\b\d+(?:\.\d+)?\s*(?:mg|mcg|g|kg|ml|l|iu|units?)\b", " ", text, flags=re.I)
+    pricing_text = re.sub(r"\b\d+\s*['’]s\b", " ", pricing_text, flags=re.I)
+    pricing_text = re.sub(r"^\s*\d+[.)-]\s*", "", pricing_text)
+
+    numeric_matches = list(re.finditer(r"(?<![\d.])(\d+(?:\.\d{1,2})?)(?![\d.])", pricing_text))
+    if not numeric_matches:
+        return None, "not_found", 1, None
+
+    total_match = numeric_matches[-1]
+    line_total = float(total_match.group(1))
+    quantity = int(explicit_quantity.group(1)) if explicit_quantity else 1
+
+    if not explicit_quantity:
+        before_total = pricing_text[:total_match.start()]
+        standalone_integers = re.findall(r"(?<![\d.])(\d{1,3})(?![\d.])", before_total)
+        if standalone_integers:
+            candidate_quantity = int(standalone_integers[0])
+            if 0 < candidate_quantity <= 100:
+                quantity = candidate_quantity
+
+    unit_price = round(line_total / quantity, 2) if quantity > 1 else line_total
+    price_type = "calculated_unit_price" if quantity > 1 else "detected_price"
+    return unit_price, price_type, quantity, line_total
+
+
+def is_price_continuation_line(line):
+    cleaned = re.sub(r"\b(?:qty|quantity|rs|inr|amount|total|price|rate)\b", " ", line or "", flags=re.I)
+    cleaned = re.sub(r"[\d\s.,:₹â‚¹xX*=-]", "", cleaned)
+    return not cleaned.strip() and bool(re.search(r"\d", line or ""))
+
+
+def load_products():
+    products = []
+    if not CSV_FILE.exists():
+        return products
+    with open(CSV_FILE, newline="", encoding="utf-8") as csvfile:
+        for row in csv.DictReader(csvfile):
+            try:
+                mrp = float(row.get("MRP", 0) or 0)
+            except ValueError:
+                mrp = 0
+            generic = row.get("Generic Name", "").strip()
+            brand = row.get("Brand Name", "").strip()
+            category = row.get("Category") or row.get("Group Name", "")
+            avg = row.get("Average Price") or row.get("Avg Price") or mrp
+            market = row.get("Market Price") or row.get("MRP") or mrp
+            products.append({
+                "generic": generic,
+                "brand": brand,
+                "category": category,
+                "unit": row.get("Unit Size", ""),
+                "mrp": mrp,
+                "average_price": float(avg or mrp),
+                "market_price": float(market or mrp),
+                "search": preprocess(" ".join([generic, brand, category, row.get("Unit Size", "")])),
+                "name_search": preprocess(" ".join([generic, brand])),
+                "primary_name": extract_primary_name(generic),
+                "dosage_form": extract_dosage_form(generic),
+                "is_combination": bool(re.search(r"\s(?:and|\+)\s|,", generic, flags=re.I)),
+                "mg": extract_mg(generic),
+            })
+    return products
+
+
+PRODUCTS = load_products()
+
+# ── Phase 5: bill-entry category keywords ────────────────────────────────────
+_CATEGORY_KEYWORDS = {
+    "lab_test": {
+        "cbc", "hemogram", "lft", "kft", "rft", "urine", "culture", "biopsy",
+        "ecg", "eeg", "mri", "ct scan", "x-ray", "xray", "ultrasound", "usg",
+        "blood test", "pathology", "lab", "serum", "thyroid", "tsh", "hba1c",
+        "glucose", "cholesterol", "lipid", "creatinine", "bilirubin", "albumin",
+        "haemoglobin", "hemoglobin", "platelet", "wbc", "rbc",
+    },
+    "consultation": {
+        "consultation", "consulting", "opd charges", "ipd charges", "visit fee",
+        "doctor fee", "physician fee", "specialist fee", "outpatient",
+        "professional fee",
+    },
+    "room_charge": {
+        "room rent", "bed charges", "ward charges", "icu charges", "nicu charges",
+        "cabin charges", "nursing charges", "accommodation", "daily charges",
+    },
+    "procedure": {
+        "surgery", "operation", "procedure", "dressing", "suture", "stitching",
+        "physiotherapy", "therapy session", "dialysis", "endoscopy", "catheter",
+        "iv administration", "nebulisation", "nebulization", "vaccination",
+    },
+    "gst": {"gst", "cgst", "sgst", "igst", "service tax"},
+}
+
+
+def categorize_entry_rule_based(text):
+    text_lower = (text or "").lower()
+    for category, keywords in _CATEGORY_KEYWORDS.items():
+        if any(kw in text_lower for kw in keywords):
+            return category
+    return "medicine"
+
+
+def find_best_product(line):
+    stripped_line = preprocess_for_matching(line)
+    line_mg = extract_mg(line)
+    line_primary = extract_primary_name(line)
+    line_form = extract_dosage_form(line)
+    line_is_combination = bool(re.search(r"\s(?:and|\+)\s|,", line, flags=re.I))
+    best_product = None
+    best_score = 0
+    for product in PRODUCTS:
+        primary_score = fuzz.ratio(line_primary, product["primary_name"]) if line_primary else 0
+        if line_primary and primary_score < 72:
+            continue
+        if line_mg and product["mg"] and abs(line_mg - product["mg"]) > 0.01:
+            continue
+        if line_form and product["dosage_form"] and line_form != product["dosage_form"]:
+            continue
+        token_score = fuzz.token_set_ratio(stripped_line, product["name_search"])
+        ratio_score = fuzz.ratio(stripped_line, product["name_search"])
+        score = (token_score * 0.45) + (ratio_score * 0.35) + (primary_score * 0.20)
+        if product["is_combination"] and not line_is_combination:
+            score -= 25
+        if score > best_score:
+            best_score = score
+            best_product = product
+    return (best_product, best_score) if best_score >= 62 else (None, best_score)
+
+
+def find_medicine_price(query):
+    product, score = find_best_product(query)
+    if not product:
+        return None
+    return (
+        f"{product['generic']} ({product['unit']}) is listed at Rs {product['mrp']:.2f} "
+        f"in the Janaushadhi dataset. Category: {product['category'] or 'N/A'}."
+    )
+
+
+def fallback_chat_response(message, language="english", mode="gemini"):
+    text = (message or "").lower()
+    if mode == "price":
+        return translate_reply("I could not find an exact medicine match. Try the generic name with strength, for example Paracetamol 500 mg.", language)
+    if "ayushman" in text or "pmjay" in text:
+        return "Ayushman Bharat PM-JAY coverage depends on the hospital empanelment and treatment package. Use the hospital filter to find likely empanelled hospitals nearby."
+    if "bill" in text or "price" in text or "mrp" in text:
+        return "Upload the bill in the scanner to compare detected prices with the Janaushadhi reference price. I can also explain individual charges here."
+    if language == "hindi":
+        return "मैं अभी सीमित मोड में जवाब दे रहा हूं। दवा, बिल, अस्पताल या आयुष्मान भारत से जुड़ा सवाल पूछें।"
+    if language == "hinglish":
+        return "Main abhi fallback mode me hoon. Aap dawa, bill, hospital ya Ayushman Bharat ke baare me pooch sakte hain."
+    return "I am running in fallback mode right now. Ask about a medicine price, bill charge, hospital search, or Ayushman Bharat coverage."
+
+
+def get_user_scan_context(user_id, limit=5):
+    context_lines = []
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, flagged, report, illness, covered, savings, timestamp
+            FROM scans
+            WHERE user_id = ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        ).fetchall()
+        history = conn.execute(
+            """
+            SELECT user_message, bot_response
+            FROM chat_history
+            WHERE user_id = ?
+            ORDER BY timestamp DESC
+            LIMIT 6
+            """,
+            (user_id,),
+        ).fetchall()
+    for row in rows:
+        try:
+            flagged = json.loads(row["flagged"] or "{}")
+        except json.JSONDecodeError:
+            flagged = {}
+        try:
+            report = json.loads(row["report"] or "{}")
+        except json.JSONDecodeError:
+            report = {}
+        if flagged:
+            flagged_summary = "; ".join(
+                f"{name}: overpaid Rs {data.get('extra', 0)} ({data.get('comparison_basis', 'unknown')} basis)"
+                for name, data in list(flagged.items())[:5]
+            )
+            context_lines.append(f"Scan {row['id']} flagged items: {flagged_summary}")
+        items = report.get("detected_items", [])[:5]
+        if items:
+            item_summary = "; ".join(
+                f"{item.get('name')}: qty {item.get('quantity')}, paid {item.get('billed_display', item.get('line_total'))}"
+                for item in items
+            )
+            context_lines.append(f"Scan {row['id']} detected medicines: {item_summary}")
+        if row["illness"]:
+            context_lines.append(f"Scan {row['id']} treatment context: {row['illness'][:200]}")
+        if row["covered"]:
+            context_lines.append(f"Scan {row['id']} PM-JAY note: {row['covered'][:200]}")
+        disclaimer = report.get("summary", {}).get("low_confidence_disclaimer")
+        if disclaimer:
+            context_lines.append(f"Scan {row['id']} OCR quality note: {disclaimer}")
+    chat_context = []
+    for item in reversed(history):
+        chat_context.append(f"User: {item['user_message'][:300]}")
+        chat_context.append(f"Assistant: {item['bot_response'][:400]}")
+    return {
+        "scan_context": "\n".join(context_lines[:12]),
+        "chat_context": "\n".join(chat_context[-8:]),
+    }
+
+
+def extract_gemini_text(response):
+    if not response:
+        return ""
+    text = getattr(response, "text", None)
+    if text:
+        return text.strip()
+    candidates = getattr(response, "candidates", None) or []
+    for candidate in candidates:
+        content = getattr(candidate, "content", None)
+        parts = getattr(content, "parts", None) if content else None
+        if not parts:
+            continue
+        chunks = [getattr(part, "text", "") for part in parts if getattr(part, "text", None)]
+        if chunks:
+            return "\n".join(chunks).strip()
+    return ""
+
+
+_LANGUAGE_INSTRUCTIONS = {
+    "english": (
+        "CRITICAL RULE: Respond ONLY in clear, simple English. "
+        "Do NOT use Hindi, Devanagari script, or Hinglish under any circumstances."
+    ),
+    "hindi": (
+        "महत्वपूर्ण निर्देश: आपको पूरी तरह हिंदी में जवाब देना है। "
+        "अंग्रेजी में जवाब देना सख्त मना है — यह नियम हर परिस्थिति में लागू होता है। "
+        "केवल दवाओं के नाम और चिकित्सा शब्दों (जैसे Paracetamol, MRI) के लिए अंग्रेजी स्वीकार्य है। "
+        "सरल और स्पष्ट हिंदी में जवाब दें। "
+        "उदाहरण: 'आपकी दवाइयों की कीमत जन औषधि की तुलना में अधिक है।'"
+    ),
+    "hinglish": (
+        "CRITICAL RULE: Respond ONLY in Hinglish — Roman/Latin script only (absolutely NO Devanagari). "
+        "Use Hindi grammar structure with English technical words mixed in naturally. "
+        "Do NOT reply in pure English. Do NOT use Devanagari script. "
+        "Write like a young urban Indian would text: casual, clear, helpful. "
+        "Example: 'Aapka bill thoda zyada lag raha hai — Jan Aushadhi reference se compare karte hain.'"
+    ),
+}
+
+
+def ask_gemini(message: str, language: str, user_id: int = None) -> str:
+    instruction = _LANGUAGE_INSTRUCTIONS.get(language, _LANGUAGE_INSTRUCTIONS["english"])
+    context_block = ""
+    if user_id:
+        context = get_user_scan_context(user_id)
+        if context["scan_context"]:
+            context_block += f"\nRecent scan analysis for this user:\n{context['scan_context']}\n"
+        if context["chat_context"]:
+            context_block += f"\nRecent chat history:\n{context['chat_context']}\n"
+    prompt = (
+        f"{instruction}\n\n"
+        "You are Nia, Nivara's care-commerce assistant — warm, professional, and reassuring, "
+        "like a knowledgeable Indian hospital help-desk staffer, never robotic or overly formal. "
+        "Do not diagnose. Explain bills, medicine pricing, Jan Aushadhi comparisons, "
+        "PM-JAY/Ayushman Bharat coverage, OCR scan results, and healthcare navigation safely. "
+        "If the user asks why a medicine was flagged, use the scan context when available. "
+        "Do not invent scan results, prices, or medical facts that are not in the context — "
+        "if you are not sure of something, say so plainly instead of guessing. "
+        "If the scan context includes an OCR quality note, gently suggest the user upload a clearer "
+        "photo of the bill for a more accurate comparison. "
+        "If the user asks about a medicine price, refer to the Janaushadhi dataset. "
+        "If you cannot find a match, say so and suggest the user try the generic name with strength. "
+        "Do not reference scan numbers in your response. "
+        "Keep replies short and to the point by default — expand only if the user asks for more detail. "
+        "Use short bullet points when listing multiple items, prices, or steps; use plain sentences for "
+        "quick answers. Never pad a reply with unnecessary paragraphs. "
+        f"{context_block}"
+        f"\nUser: {message}\n\n"
+        f"REMINDER — {instruction}"
+    )
+    # Lower temperature = more deterministic language compliance
+    temperature = 0.1 if language in ("hindi", "hinglish") else 0.4
+    gen_cfg = {"temperature": temperature, "max_output_tokens": 700}
+    response = _gemini_generate_with_fallback(prompt, generation_config=gen_cfg)
+    reply = extract_gemini_text(response)
+    if not reply:
+        raise RuntimeError("Gemini returned an empty response")
+    return reply
+
+
+def save_chat(user_id, message, reply, language, mode):
+    with get_db_connection() as conn:
+        conn.execute(
+            "INSERT INTO chat_history (user_id, user_message, bot_response, language, mode) VALUES (?, ?, ?, ?, ?)",
+            (user_id, message, reply, language, mode),
+        )
+        conn.commit()
+
+
+def is_password_valid(stored, candidate):
+    if not stored:
+        return False
+    if stored.startswith(("pbkdf2:", "scrypt:")):
+        return check_password_hash(stored, candidate)
+    return stored == candidate
+
+
+def upgrade_password_if_plaintext(conn, user_id, stored, candidate):
+    if stored and not stored.startswith(("pbkdf2:", "scrypt:")) and stored == candidate:
+        conn.execute("UPDATE users SET password = ? WHERE id = ?", (generate_password_hash(candidate), user_id))
+        conn.commit()
+
+
+def _email_from_address():
+    sender_email = os.getenv("BREVO_SENDER_EMAIL")
+    sender_name = os.getenv("BREVO_SENDER_NAME", "Nivara")
+    if not sender_email:
+        return ""
+    return f"{sender_name} <{sender_email}>"
+
+
+def _email_provider_name():
+    if os.getenv("BREVO_API_KEY"):
+        return "brevo"
+    return "not_configured"
+
+
+def _send_email_http(to_email, subject, body):
+    brevo_key = os.getenv("BREVO_API_KEY")
+    reply_to = os.getenv("EMAIL_REPLY_TO")
+
+    if not brevo_key:
+        raise RuntimeError("BREVO_API_KEY is required")
+
+    sender_email = os.getenv("BREVO_SENDER_EMAIL")
+    sender_name = os.getenv("BREVO_SENDER_NAME", "Nivara")
+    if not sender_email:
+        raise RuntimeError("BREVO_SENDER_EMAIL is required")
+
+    payload = {
+        "sender": {"name": sender_name, "email": sender_email},
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "textContent": body,
+    }
+    if reply_to:
+        payload["replyTo"] = {"email": reply_to}
+    req = Request(
+        "https://api.brevo.com/v3/smtp/email",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "api-key": brevo_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urlopen(req, timeout=20) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            if response.status >= 400:
+                raise RuntimeError(f"Brevo returned HTTP {response.status}: {body[:500]}")
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Brevo returned HTTP {exc.code}: {body[:500]}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Could not reach Brevo API: {exc.reason}") from exc
+
+
+def send_email(to_email, subject, body):
+    provider = _email_provider_name()
+    if provider != "brevo":
+        raise RuntimeError("Email is not configured")
+    _send_email_http(to_email, subject, body)
+    return provider
+
+
+def send_otp_email(email, otp, purpose="forgot_password"):
+    body = _(
+        "Your Nivara OTP for %(purpose)s is %(otp)s. It is valid for this session.",
+        purpose=purpose.replace('_', ' '), otp=otp,
+    )
+    try:
+        provider = send_email(email, _("Your Nivara OTP"), body)
+        app.logger.info("OTP email sent via %s", provider)
+        return True, _("OTP sent to your email.")
+    except Exception as exc:
+        app.logger.exception("OTP email failed")
+        return False, _("Could not send OTP email: %(reason)s", reason=str(exc))
+
+
+def clean_ocr_text(text):
+    text = (text or "").replace("\x0c", " ")
+    text = text.replace("₹", " Rs ").replace("â‚¹", " Rs ")
+    text = text.replace("|", " ").replace("¦", " ")
+    # Strip dot/dash leaders used in Indian bills: "Medicine .......... Rs 120" or "Medicine -------- 120"
+    text = re.sub(r"[.\-_]{3,}", " ", text)
+    text = re.sub(r"[^\S\r\n]+", " ", text)
+    text = re.sub(r"\s*([,:;])\s*", r" \1 ", text)
+    return "\n".join(normalize_ocr_line(line.strip()) for line in text.splitlines() if line.strip())
+
+
+def normalize_ocr_line(line):
+    line = re.sub(r"^[^a-zA-Z0-9]+", "", line or "")
+    digit_map = str.maketrans({
+        "O": "0", "o": "0", "E": "0", "e": "0", "@": "0",
+        "I": "1", "i": "1", "l": "1", "S": "5", "s": "5",
+        "B": "8", "b": "8",
+    })
+
+    def fix_strength(match):
+        raw_number = match.group(1).translate(digit_map)
+        unit = match.group(2).lower().replace("n", "m")
+        return f"{raw_number}{unit}"
+
+    return re.sub(
+        r"\b([0-9OoEe@IlisSBb]{1,6})\s*(mg|ng|ml|mcg)\b",
+        fix_strength,
+        line,
+        flags=re.I,
+    )
+
+
+def strip_trailing_numeric_columns(text):
+    tokens = (text or "").split()
+    while tokens:
+        token = tokens[-1].lower().rstrip(".,")
+        if re.fullmatch(r"(?:rs\.?|inr)?\d+(?:\.\d{1,2})?", token):
+            tokens.pop()
+            continue
+        break
+    return " ".join(tokens)
+
+
+def preprocess_for_matching(text):
+    return preprocess(strip_trailing_numeric_columns(text))
+
+
+def ocr_quality_score(text):
+    clean_text = text or ""
+    alpha_num = len(re.findall(r"[a-z0-9]", clean_text.lower()))
+    digit_count = len(re.findall(r"\d", clean_text))
+    lines = [line.strip() for line in clean_text.splitlines() if line.strip()]
+    line_count = len(lines)
+    receipt_rows = sum(
+        1 for line in lines
+        if re.search(r"[a-zA-Z]{3,}", line) and re.search(r"(?:rs\.?\s*)?\d+(?:\.\d{1,2})?\s*$", line, re.I)
+    )
+    fragmented_rows = sum(1 for line in lines if re.fullmatch(r"[\d.,]+", line))
+    medicine_hint_count = len(
+        re.findall(r"\b(?:tablet|tablets|tab|capsule|capsules|cap|mg|ml|syrup|injection)\b", clean_text.lower())
+    )
+    return alpha_num + (line_count * 10) + (medicine_hint_count * 20) + (receipt_rows * 60) + digit_count - (fragmented_rows * 20)
+
+
+def estimate_ocr_quality(text):
+    clean_text = clean_ocr_text(text)
+    lines = [line.strip() for line in clean_text.splitlines() if line.strip()]
+    if not clean_text or not lines:
+        return {
+            "tier": "failed",
+            "score": 0,
+            "line_count": 0,
+            "likely_usable": False,
+            "note": "No readable text was extracted.",
+        }
+
+    score = ocr_quality_score(clean_text)
+    alpha_num = len(re.findall(r"[a-z0-9]", clean_text.lower()))
+    suspicious_chars = len(re.findall(r"[^a-zA-Z0-9\s.,:;()/+\-₹]", clean_text))
+    suspicious_ratio = round(suspicious_chars / max(len(clean_text), 1), 3)
+    medicine_hint_count = len(
+        re.findall(r"\b(?:tablet|tablets|tab|capsule|capsules|cap|mg|ml|syrup|injection|inj|strip)\b", clean_text.lower())
+    )
+    amount_rows = sum(
+        1 for line in lines
+        if re.search(r"(?:rs\.?|inr|₹)?\s*\d+(?:\.\d{1,2})?\s*$", line, re.I)
+    )
+
+    if score >= 260 and len(lines) >= 5 and suspicious_ratio < 0.08:
+        tier = "high"
+        note = "OCR looks usable for automated bill analysis, with normal manual review."
+    elif score >= 120 and len(lines) >= 3 and suspicious_ratio < 0.15:
+        tier = "medium"
+        note = "OCR is partially usable. Ask the user to confirm medicine names, quantities, and prices."
+    else:
+        tier = "low"
+        note = "OCR quality is weak. A clearer, flatter, well-lit image should improve results."
+
+    return {
+        "tier": tier,
+        "score": score,
+        "line_count": len(lines),
+        "alpha_numeric_chars": alpha_num,
+        "amount_like_rows": amount_rows,
+        "medicine_hint_count": medicine_hint_count,
+        "suspicious_char_ratio": suspicious_ratio,
+        "likely_usable": tier in {"high", "medium"},
+        "note": note,
+    }
+
+
+def preprocess_image_for_ocr(image, invert=False):
+    working = image.convert("L")
+    max_side = max(working.size)
+    if max_side < 1800:
+        scale = max(2, min(4, int(round(1800 / max_side))))
+        working = working.resize((working.width * scale, working.height * scale), Image.LANCZOS)
+    working = ImageOps.autocontrast(working)
+    if invert:
+        working = ImageOps.invert(working)
+    working = working.filter(ImageFilter.SHARPEN)
+    working = ImageEnhance.Contrast(working).enhance(1.8)
+    working = ImageEnhance.Sharpness(working).enhance(1.4)
+    return working
+
+
+def threshold_image(image, invert=False, level=175):
+    working = image.convert("L")
+    if invert:
+        working = ImageOps.invert(working)
+    return working.point(lambda px: 255 if px >= level else 0)
+
+
+def preprocess_image_for_print(image):
+    """Light, clean preprocessing for printed/typed documents (receipts, bills, typed reports)."""
+    if Image is None:
+        return image
+    working = image.convert("L")
+    max_side = max(working.size)
+    if max_side < 2000:
+        scale = max(1.5, 2000 / max_side)
+        working = working.resize(
+            (int(working.width * scale), int(working.height * scale)), Image.LANCZOS
+        )
+    working = ImageOps.autocontrast(working, cutoff=1)
+    working = ImageEnhance.Contrast(working).enhance(1.5)
+    working = ImageEnhance.Sharpness(working).enhance(1.2)
+    return working
+
+
+def preprocess_image_for_handwriting(image):
+    """Stronger preprocessing tuned for handwritten text."""
+    if Image is None:
+        return image
+    working = image.convert("L")
+    max_side = max(working.size)
+    if max_side < 2200:
+        scale = max(2, int(2200 / max_side))
+        working = working.resize((working.width * scale, working.height * scale), Image.LANCZOS)
+    working = ImageOps.autocontrast(working, cutoff=3)
+    working = ImageEnhance.Contrast(working).enhance(2.8)
+    working = ImageEnhance.Sharpness(working).enhance(2.2)
+    working = working.filter(ImageFilter.EDGE_ENHANCE_MORE)
+    return working
+
+
+def deskew_image(image):
+    if pytesseract is None or Image is None:
+        return image
+    try:
+        osd = pytesseract.image_to_osd(image, config="--psm 0 -c min_characters_to_try=5")
+        angle_match = re.search(r"Rotate:\s*(\d+)", osd)
+        if angle_match:
+            angle = int(angle_match.group(1))
+            if angle in (90, 180, 270):
+                return image.rotate(-angle, expand=True)
+    except Exception:
+        pass
+    return image
+
+
+def _ocr_with_easyocr(image):
+    if _easyocr_module is None or Image is None:
+        return ""
+    try:
+        import numpy as np
+        key = ("en",)
+        if key not in _easyocr_cache:
+            _easyocr_cache[key] = _easyocr_module.Reader(list(key), gpu=False, verbose=False)
+        reader = _easyocr_cache[key]
+        np_image = np.array(image.convert("RGB"))
+        results = reader.readtext(np_image, detail=0, paragraph=False)
+        return clean_ocr_text("\n".join(str(r) for r in results))
+    except Exception as exc:
+        app.logger.warning("EasyOCR failed: %s", exc)
+        return ""
+
+
+def ocr_image_to_text(image):
+    if Image is None:
+        return ""
+
+    lang = os.getenv("TESSERACT_LANG", "eng")
+    candidates = []
+
+    if pytesseract is not None:
+        # ── Fast path: printed/typed document (receipts, computer-generated bills) ──
+        print_img = preprocess_image_for_print(image)
+        fast_configs = [
+            f"--oem 3 --psm 6 -l {lang}",   # uniform text block
+            f"--oem 3 --psm 4 -l {lang}",   # single column with varying text sizes
+            f"--oem 3 --psm 3 -l {lang}",   # fully automatic (best for unknown layouts)
+            f"--oem 1 --psm 6 -l {lang}",   # LSTM only
+        ]
+        for config in fast_configs:
+            try:
+                text = pytesseract.image_to_string(print_img, config=config)
+            except Exception:
+                continue
+            cleaned = clean_ocr_text(text)
+            if cleaned:
+                candidates.append(cleaned)
+
+        # If the fast path already gives a good result, skip the expensive pipeline
+        fast_best = max(candidates, key=ocr_quality_score) if candidates else ""
+        if ocr_quality_score(fast_best) > 120:
+            # Also try the raw image in case preprocessing hurt (dark backgrounds etc.)
+            for config in fast_configs[:2]:
+                try:
+                    text = pytesseract.image_to_string(image, config=config)
+                except Exception:
+                    continue
+                cleaned = clean_ocr_text(text)
+                if cleaned:
+                    candidates.append(cleaned)
+            if _easyocr_module is not None:
+                easy = _ocr_with_easyocr(image)
+                if easy:
+                    candidates.append(easy)
+            return max(candidates, key=ocr_quality_score)
+
+        # ── Full pipeline: low-quality scan, photo, or handwritten document ─────────
+        base     = preprocess_image_for_ocr(image, invert=False)
+        hw       = preprocess_image_for_handwriting(image)
+        deskewed = deskew_image(image)
+
+        variants = [
+            print_img,
+            base,
+            threshold_image(base, invert=False, level=175),
+            threshold_image(base, invert=True,  level=175),
+            image,
+            hw,
+            threshold_image(hw, invert=False, level=160),
+        ]
+        mean_brightness = ImageStat.Stat(base).mean[0]
+        if mean_brightness < 140:
+            variants.append(preprocess_image_for_ocr(image, invert=True))
+        else:
+            variants.append(ImageOps.invert(base))
+
+        if deskewed is not image:
+            deskew_base = preprocess_image_for_ocr(deskewed, invert=False)
+            variants.extend([
+                preprocess_image_for_print(deskewed),
+                deskew_base,
+                threshold_image(deskew_base, invert=False, level=175),
+            ])
+
+        configs = [
+            f"--oem 3 --psm 6 -l {lang}",
+            f"--oem 3 --psm 4 -l {lang}",
+            f"--oem 3 --psm 3 -l {lang}",
+            f"--oem 3 --psm 11 -l {lang}",
+            f"--oem 1 --psm 6 -l {lang}",
+            f"--oem 1 --psm 4 -l {lang}",
+        ]
+
+        for prepared in variants:
+            for config in configs:
+                try:
+                    text = pytesseract.image_to_string(prepared, config=config)
+                except Exception:
+                    continue
+                cleaned = clean_ocr_text(text)
+                if cleaned:
+                    candidates.append(cleaned)
+
+    # ── EasyOCR always runs — handles handwriting and low-quality photos well ──
+    if _easyocr_module is not None:
+        easy = _ocr_with_easyocr(image)
+        if easy:
+            candidates.append(easy)
+
+    if not candidates:
+        return ""
+
+    return max(candidates, key=ocr_quality_score)
+
+
+def extract_pdf_text(file_path):
+    extracted_text = ""
+    if PdfReader is not None:
+        try:
+            reader = PdfReader(str(file_path))
+            extracted_pages = []
+            for page in reader.pages:
+                page_text = page.extract_text() or ""
+                if page_text.strip():
+                    extracted_pages.append(page_text)
+            extracted_text = clean_ocr_text("\n".join(extracted_pages))
+            if len(re.findall(r"[a-zA-Z]{3,}", extracted_text)) >= 3:
+                return extracted_text, "pdf_text"
+        except Exception as exc:
+            app.logger.warning("PDF text extraction failed: %s", exc)
+
+    if pdfium is not None and pytesseract is not None and Image is not None:
+        try:
+            document = pdfium.PdfDocument(str(file_path))
+            page_texts = []
+            max_pages = min(len(document), int(os.getenv("PDF_OCR_MAX_PAGES", "12")))
+            render_scale = float(os.getenv("PDF_OCR_SCALE", "3.5"))
+            for page_index in range(max_pages):
+                page = document[page_index]
+                bitmap = page.render(scale=render_scale, rotation=0)
+                page_image = bitmap.to_pil()
+                page_text = ocr_image_to_text(page_image)
+                if page_text.strip():
+                    page_texts.append(page_text)
+                bitmap.close()
+                page.close()
+            document.close()
+            rendered_text = clean_ocr_text("\n".join(page_texts))
+            if rendered_text:
+                return rendered_text, "pdf_ocr"
+        except Exception as exc:
+            app.logger.warning("PDFium rendering/OCR failed: %s", exc)
+
+    # This fallback handles simple scan PDFs that contain a full-page image.
+    if PdfReader is not None and pytesseract is not None and Image is not None:
+        try:
+            reader = PdfReader(str(file_path))
+            image_texts = []
+            for page in reader.pages[:int(os.getenv("PDF_OCR_MAX_PAGES", "12"))]:
+                ranked_images = []
+                for image_file in page.images:
+                    pil_image = image_file.image
+                    ranked_images.append((pil_image.width * pil_image.height, pil_image))
+                for _, pil_image in sorted(ranked_images, key=lambda item: item[0], reverse=True)[:2]:
+                    image_text = ocr_image_to_text(pil_image)
+                    if image_text.strip():
+                        image_texts.append(image_text)
+            embedded_text = clean_ocr_text("\n".join(image_texts))
+            if embedded_text:
+                return embedded_text, "pdf_embedded_image_ocr"
+        except Exception as exc:
+            app.logger.warning("Embedded PDF image OCR failed: %s", exc)
+    return "", "unavailable"
+
+
+ALLOWED_COMPARISON_BASES = frozenset({"tablet", "strip", "pack", "line_total", "unknown"})
+STRUCTURE_CONFIDENCE_THRESHOLD = 0.55
+LOW_CONFIDENCE_THRESHOLD = 0.50   # was 0.6 — rule-based results were unfairly "low"
+HIGH_CONFIDENCE_THRESHOLD = 0.75
+
+
+_GEMINI_FALLBACK_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-flash-latest",
+]
+
+
+def _gemini_generate_with_fallback(prompt, generation_config=None):
+    """Try the configured model, cascade through fallbacks on quota/timeout errors."""
+    client = get_gemini_client()
+    primary = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    models_to_try = [primary] + [m for m in _GEMINI_FALLBACK_MODELS if m != primary]
+    last_exc = None
+    for attempt, model_name in enumerate(models_to_try):
+        try:
+            config_kwargs = dict(generation_config or {})
+            config_kwargs["http_options"] = genai_types.HttpOptions(timeout=28000)
+            config = genai_types.GenerateContentConfig(**config_kwargs)
+            return client.models.generate_content(model=model_name, contents=prompt, config=config)
+        except Exception as exc:
+            last_exc = exc
+            err = str(exc).lower()
+            is_quota = any(k in err for k in ("429", "quota", "rate limit", "resource_exhausted"))
+            is_timeout = any(k in err for k in ("timeout", "deadline exceeded", "timed out"))
+            if is_quota:
+                wait = min(2 ** attempt, 10)
+                app.logger.warning("Quota on %s (attempt %d), backing off %ds. %s", model_name, attempt + 1, wait, exc)
+                time.sleep(wait)
+                continue
+            if is_timeout:
+                app.logger.warning("Timeout on %s, trying next model.", model_name)
+                time.sleep(1)
+                continue
+            app.logger.error("Gemini call failed on %s: %s", model_name, exc, exc_info=True)
+            raise
+    raise last_exc
+
+
+def gemini_generate_json(prompt):
+    generation_config = {"response_mime_type": "application/json"}
+    response = _gemini_generate_with_fallback(prompt, generation_config=generation_config)
+    if not response or not getattr(response, "text", None):
+        return None
+    return response.text.strip()
+
+
+def parse_json_payload(text):
+    if not text:
+        return None
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r"[\[{][\s\S]*[\]}]", cleaned)
+        if not match:
+            return None
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
+
+
+def confidence_tier(confidence):
+    if confidence is None:
+        return "low"
+    try:
+        value = float(confidence)
+    except (TypeError, ValueError):
+        return "low"
+    if value >= HIGH_CONFIDENCE_THRESHOLD:
+        return "high"
+    if value >= LOW_CONFIDENCE_THRESHOLD:
+        return "medium"
+    return "low"
+
+
+def parse_csv_pack_info(unit_text):
+    text = (unit_text or "").strip()
+    lowered = text.lower()
+
+    count_match = re.search(r"(\d+)\s*'?\s*s\b", lowered)
+    if count_match:
+        return {"pack_size": max(int(count_match.group(1)), 1), "unit_kind": "count"}
+
+    count_unit_match = re.search(
+        r"\b(\d+)\s*(?:tablets?|tabs?|capsules?|caps?|pads?|sachets?|strips?|ear\s*buds?)\b",
+        lowered,
+    )
+    if count_unit_match:
+        return {"pack_size": max(int(count_unit_match.group(1)), 1), "unit_kind": "count"}
+
+    if re.search(r"\b(?:ml|g|gm|kg|l|vial|wfi|bottle|tube|jar|syrup|drops?|gel|cream|ointment|powder|spray|syringe|case|bag)\b", lowered):
+        return {"pack_size": 1, "unit_kind": "pack"}
+
+    match = re.search(r"(\d+)", lowered)
+    return {"pack_size": max(int(match.group(1)), 1), "unit_kind": "count"} if match else {"pack_size": 1, "unit_kind": "pack"}
+
+
+def parse_csv_pack_size(unit_text):
+    return parse_csv_pack_info(unit_text)["pack_size"]
+
+
+PACK_SIZE_BILL_PATTERNS = [
+    (re.compile(r"strip\s+of\s+(\d+)", re.I), 1),
+    (re.compile(r"pack\s+of\s+(\d+)", re.I), 1),
+    (re.compile(r"\b(\d+)\s*x\s*(\d+)\b", re.I), 2),
+    (re.compile(r"\(\s*(\d+)\s*(?:tablets?|tabs?|capsules?|caps?)\s*\)", re.I), 1),
+    (re.compile(r"\b(\d+)\s*(?:tablets?|tabs?|capsules?|caps?)\b", re.I), 1),
+]
+
+
+def extract_pack_size(text):
+    for pattern, group_index in PACK_SIZE_BILL_PATTERNS:
+        match = pattern.search(text or "")
+        if not match:
+            continue
+        try:
+            size = int(match.group(group_index))
+        except (TypeError, ValueError):
+            continue
+        if 1 <= size <= 1000:
+            return {"pack_size": size, "source": "bill"}
+    return {"pack_size": None, "source": "unknown"}
+
+
+def gemini_infer_pack_size(bill_line, medicine_name, csv_pack_size):
+    if genai is None or not os.getenv("GOOGLE_API_KEY"):
+        return None
+    try:
+        prompt = f"""Infer the medicine pack size (number of tablets/capsules per strip or pack) from this bill line.
+DO NOT calculate prices or totals.
+Return ONLY valid JSON:
+{{"pack_size": 10, "confidence": 0.85, "reasoning": "brief reason"}}
+
+Use null for pack_size if unknown.
+Bill line: {bill_line}
+Medicine: {medicine_name}
+Reference CSV pack size (fallback only): {csv_pack_size}
+"""
+        raw = gemini_generate_json(prompt)
+        payload = parse_json_payload(raw)
+        if not isinstance(payload, dict):
+            return None
+        pack_size = payload.get("pack_size")
+        if pack_size is None:
+            return None
+        pack_size = int(pack_size)
+        if not 1 <= pack_size <= 1000:
+            return None
+        return {
+            "pack_size": pack_size,
+            "source": "gemini",
+            "confidence": max(0.0, min(float(payload.get("confidence", 0.7)), 1.0)),
+            "reasoning": str(payload.get("reasoning", "")).strip(),
+        }
+    except Exception as exc:
+        app.logger.warning("Gemini pack size inference unavailable: %s", exc)
+        return None
+
+
+def resolve_pack_size(bill_line, product):
+    bill_pack = extract_pack_size(bill_line)
+    if bill_pack["pack_size"]:
+        return bill_pack
+    csv_pack = parse_csv_pack_size(product.get("unit", ""))
+    gemini_pack = gemini_infer_pack_size(bill_line, product.get("generic", ""), csv_pack)
+    if gemini_pack and gemini_pack.get("pack_size"):
+        return gemini_pack
+    return {"pack_size": csv_pack, "source": "csv"}
+
+
+def get_reference_prices(product, pack_info=None):
+    csv_pack = parse_csv_pack_info(product.get("unit", ""))
+    csv_pack_size = csv_pack["pack_size"]
+    if pack_info and pack_info.get("pack_size"):
+        bill_pack_size = int(pack_info["pack_size"])
+        pack_source = pack_info.get("source", "csv")
+    else:
+        bill_pack_size = csv_pack_size
+        pack_source = "csv"
+    csv_mrp = float(product.get("mrp") or 0)
+    per_tablet = round(csv_mrp / csv_pack_size, 6) if csv_pack_size else csv_mrp
+    normalized_strip = round(per_tablet * bill_pack_size, 4)
+    return {
+        "csv_pack_size": csv_pack_size,
+        "bill_pack_size": bill_pack_size,
+        "pack_size": bill_pack_size,
+        "pack_size_source": pack_source,
+        "unit_label": product.get("unit", ""),
+        "unit_kind": csv_pack["unit_kind"],
+        "csv_mrp": csv_mrp,
+        "per_tablet_price": per_tablet,
+        "strip_price": normalized_strip,
+        "tablet_price": per_tablet,
+        "pack_price": normalized_strip,
+        "normalized": bill_pack_size != csv_pack_size,
+    }
+
+
+def parse_gemini_json_response(text):
+    payload = parse_json_payload(text)
+    if not isinstance(payload, dict):
+        return None
+    basis = str(payload.get("comparison_basis", "")).lower().strip()
+    if basis not in ALLOWED_COMPARISON_BASES:
+        return None
+    try:
+        confidence = float(payload.get("confidence", 0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return {
+        "comparison_basis": basis,
+        "confidence": max(0.0, min(confidence, 1.0)),
+        "reasoning": str(payload.get("reasoning", "")).strip(),
+    }
+
+
+def gemini_bill_structure_extraction(ocr_text):
+    if genai is None or not os.getenv("GOOGLE_API_KEY"):
+        return None
+    try:
+        prompt = f"""Extract medicine line items from this medical bill OCR text.
+DO NOT calculate totals, savings, percentages, GST, or discounts.
+Ignore dates, addresses, hospital names, phone numbers, patient names, and grand totals.
+Return ONLY valid JSON:
+{{
+  "items": [
+    {{"medicine": "Paracetamol 500mg", "quantity": 2, "amount": 120}}
+  ],
+  "confidence": 0.89
+}}
+
+Rules:
+- Include only medicines/drugs with a price
+- quantity defaults to 1 if missing
+- amount is the line total in rupees
+- confidence reflects how complete and reliable the extraction is
+
+OCR Text:
+{(ocr_text or "")[:8000]}
+"""
+        raw = gemini_generate_json(prompt)
+        payload = parse_json_payload(raw)
+        if not isinstance(payload, dict):
+            return None
+        items = payload.get("items")
+        if not isinstance(items, list):
+            return None
+        cleaned_items = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            medicine = str(item.get("medicine", "")).strip()
+            if len(medicine) < 3:
+                continue
+            try:
+                quantity = int(item.get("quantity", 1) or 1)
+            except (TypeError, ValueError):
+                quantity = 1
+            try:
+                amount = float(item.get("amount"))
+            except (TypeError, ValueError):
+                continue
+            if amount <= 0:
+                continue
+            cleaned_items.append({
+                "medicine": medicine,
+                "quantity": max(1, min(quantity, 1000)),
+                "amount": round(amount, 2),
+            })
+        if not cleaned_items:
+            return None
+        try:
+            confidence = float(payload.get("confidence", 0.5))
+        except (TypeError, ValueError):
+            confidence = 0.5
+        return {
+            "items": cleaned_items,
+            "confidence": max(0.0, min(confidence, 1.0)),
+        }
+    except Exception as exc:
+        app.logger.warning("Gemini bill structure extraction unavailable: %s", exc)
+        return None
+
+
+def extract_rule_based_bill_lines(text):
+    lines = clean_ocr_text(text).splitlines()
+    bill_lines = []
+    for index, raw_line in enumerate(lines):
+        if not re.search(r"[a-zA-Z]{3,}", raw_line):
+            continue
+        combined_line = raw_line
+        if extract_billing_info(raw_line)[3] is None:
+            for next_line in lines[index + 1:index + 3]:
+                if not is_price_continuation_line(next_line):
+                    break
+                combined_line = f"{combined_line} {next_line}"
+        bill_lines.append({
+            "raw_line": combined_line,
+            "source": "rule_based",
+            "structure_confidence": 0.55,
+        })
+    return bill_lines
+
+
+def fallback_commercial_interpretation(unit_price, line_total, quantity, refs):
+    qty = quantity or 1
+    unit_price = unit_price if unit_price is not None else (line_total or 0)
+    line_total = line_total if line_total is not None else unit_price
+    per_unit = round(line_total / qty, 2) if qty > 1 else line_total
+    candidates = [
+        ("strip", refs["strip_price"], per_unit),
+        ("tablet", refs["tablet_price"], round(line_total / qty, 4) if qty else line_total),
+        ("pack", refs["pack_price"], per_unit),
+        ("line_total", refs["strip_price"] * qty, line_total),
+    ]
+    best_basis = "strip"
+    best_ratio = float("inf")
+    for basis, expected, billed in candidates:
+        if not expected:
+            continue
+        ratio = abs(billed - expected) / expected
+        if ratio < best_ratio:
+            best_ratio = ratio
+            best_basis = basis
+    return {
+        "comparison_basis": best_basis,
+        "confidence": 0.60,
+        "reasoning": "Rule-based fallback: closest reference price match selected.",
+    }
+
+
+def gemini_commercial_interpretation(bill_line, quantity, line_total, unit_price, product, refs, ocr_text=""):
+    fallback = fallback_commercial_interpretation(unit_price, line_total, quantity, refs)
+    if genai is None or not os.getenv("GOOGLE_API_KEY"):
+        return fallback
+    try:
+        prompt = f"""You interpret how a medical bill line item should be commercially compared against Jan Aushadhi reference pricing.
+
+DO NOT calculate prices, percentages, savings, totals, or any numeric comparison results.
+Return ONLY valid JSON with exactly these keys:
+- comparison_basis: one of "tablet", "strip", "pack", "line_total", "unknown"
+- confidence: number from 0 to 1
+- reasoning: one short sentence explaining the commercial interpretation
+
+Bill Line:
+{bill_line}
+
+OCR Context:
+{(ocr_text or "")[:2000]}
+
+Extracted Facts:
+- Quantity: {quantity}
+- Line Total: Rs {line_total}
+- Unit Price: Rs {unit_price}
+
+Reference Dataset:
+- Medicine: {product['generic']}
+- CSV Pack Size: {refs['unit_label']} ({refs['csv_pack_size']} units)
+- Bill Pack Size Used: {refs['bill_pack_size']} ({refs['pack_size_source']})
+- Jan Aushadhi CSV MRP: Rs {refs['csv_mrp']}
+- Normalized Strip Price (for bill pack size): Rs {refs['strip_price']}
+- Jan Aushadhi Tablet Price: Rs {refs['tablet_price']}
+
+Choose comparison_basis based on what the billed amount most likely represents.
+Use "unknown" only if the commercial unit cannot be determined reliably.
+"""
+        raw = gemini_generate_json(prompt)
+        decision = parse_gemini_json_response(raw)
+        if not decision:
+            return fallback
+        if decision["comparison_basis"] == "unknown":
+            fb = fallback_commercial_interpretation(unit_price, line_total, quantity, refs)
+            decision["comparison_basis"] = fb["comparison_basis"]
+            decision["confidence"] = min(decision.get("confidence", 0.4), fb.get("confidence", 0.45))
+            decision["reasoning"] = decision.get("reasoning") or fb.get("reasoning", "")
+        return decision
+    except Exception as exc:
+        app.logger.warning("Gemini commercial interpretation unavailable: %s", exc)
+        fallback["reasoning"] = f"AI interpretation unavailable ({exc}); using rule-based fallback."
+        return fallback
+
+
+def compute_commercial_pricing(decision, refs, quantity, line_total, unit_price):
+    basis = decision.get("comparison_basis", "strip")
+    qty = quantity or 1
+    line_total = line_total if line_total is not None else (unit_price or 0)
+    unit_price = unit_price if unit_price is not None else line_total
+    per_qty_price = round(line_total / qty, 2) if qty > 1 else round(line_total, 2)
+
+    if basis == "tablet":
+        expected_price = refs["tablet_price"]
+        billed_price = round(line_total / qty, 4) if qty else round(line_total, 4)
+        expected_line_total = round(expected_price * qty, 2)
+    elif basis == "pack":
+        expected_price = refs["pack_price"]
+        billed_price = per_qty_price
+        expected_line_total = round(expected_price * qty, 2)
+    elif basis == "line_total":
+        expected_price = round(refs["strip_price"] * qty, 2)
+        billed_price = round(line_total, 2)
+        expected_line_total = expected_price
+    else:
+        basis = "strip"
+        expected_price = refs["strip_price"]
+        billed_price = per_qty_price
+        expected_line_total = round(expected_price * qty, 2)
+
+    difference = round(billed_price - expected_price, 2)
+    overpricing_percentage = (
+        round((difference / expected_price) * 100, 2)
+        if expected_price and difference > 0
+        else 0
+    )
+    total_difference = round(line_total - expected_line_total, 2)
+    item_confidence = decision.get("confidence")
+    tier = confidence_tier(item_confidence)
+
+    return {
+        "comparison_basis": basis,
+        "ai_confidence": item_confidence,
+        "confidence_tier": tier,
+        "expected_price": expected_price,
+        "billed_price": billed_price,
+        "difference": difference,
+        "overpricing_percentage": overpricing_percentage,
+        "expected_line_total": expected_line_total,
+        "total_difference": total_difference,
+        "interpretation_reasoning": decision.get("reasoning", ""),
+        "low_confidence_disclaimer": (
+            "Estimated comparison based on limited bill information."
+            if tier == "low"
+            else ""
+        ),
+    }
+
+
+def _pluralize_unit(unit, count):
+    if count == 1:
+        return unit
+    if unit.endswith("s"):
+        return unit
+    return f"{unit}s"
+
+
+def build_result_display_labels(quantity, comparison_basis, refs, line_total, pricing):
+    qty = quantity or 1
+    basis = comparison_basis or "strip"
+    unit_names = {
+        "tablet": "tablet",
+        "strip": "strip",
+        "pack": "pack",
+        "line_total": "strip",
+    }
+    unit = unit_names.get(basis, "unit")
+    unit_plural = _pluralize_unit(unit, qty)
+    pack_label = refs.get("unit_label") or f"{refs['pack_size']}'s"
+    pack_size = refs.get("bill_pack_size", refs.get("pack_size", 1))
+    csv_pack_size = refs.get("csv_pack_size", pack_size)
+
+    quantity_display = f"{qty} {unit_plural}"
+    quantity_detail = f"Bill quantity interpreted as {qty} {_pluralize_unit(unit, qty)}"
+    if refs.get("normalized"):
+        quantity_detail += f" (bill pack: {pack_size}, Jan Aushadhi reference: {csv_pack_size})"
+    elif pack_size > 1 and basis in {"strip", "pack", "line_total"}:
+        quantity_detail += f" ({pack_label} per {unit})"
+    elif basis == "tablet" and pack_size > 1:
+        quantity_detail += f" (reference pack: {pack_label})"
+
+    line_total_value = line_total if line_total is not None else pricing["billed_price"]
+    if basis == "line_total":
+        billed_display = f"Rs {line_total_value:.2f} (full line total for {quantity_display})"
+        expected_display = f"Rs {pricing['expected_line_total']:.2f} expected for {quantity_display}"
+    else:
+        billed_display = (
+            f"Rs {line_total_value:.2f} total - Rs {pricing['billed_price']:.2f} per {unit}"
+        )
+        expected_display = (
+            f"Rs {pricing['expected_line_total']:.2f} for {quantity_display} "
+            f"(Rs {pricing['expected_price']:.2f} per {unit})"
+        )
+
+    return {
+        "quantity_display": quantity_display,
+        "quantity_detail": quantity_detail,
+        "pack_size_display": f"{pack_size} units" if refs.get("normalized") else pack_label,
+        "billed_display": billed_display,
+        "expected_display": expected_display,
+        "comparison_label": f"Compared per {unit}",
+    }
+
+
+def process_bill_line(raw_line, ocr_text, structure_confidence=0.55, parse_source="rule_based"):
+    product = None
+    score = 0
+    best_candidate = raw_line
+    best_pricing = (None, "not_found", 1, None)
+    candidate_lines = [raw_line]
+    for candidate_line in candidate_lines:
+        candidate_product, candidate_score = find_best_product(candidate_line)
+        candidate_pricing = extract_billing_info(candidate_line)
+        candidate_has_price = candidate_pricing[3] is not None
+        if candidate_score > score or (candidate_product and candidate_score == score and candidate_has_price):
+            product = candidate_product
+            score = candidate_score
+            best_candidate = candidate_line
+            best_pricing = candidate_pricing
+    if not product:
+        return None
+
+    billed, price_type, quantity, line_total = best_pricing
+    pack_info = resolve_pack_size(best_candidate, product)
+    refs = get_reference_prices(product, pack_info)
+    decision = gemini_commercial_interpretation(
+        best_candidate,
+        quantity,
+        line_total,
+        billed,
+        product,
+        refs,
+        ocr_text=ocr_text,
+    )
+    pricing = compute_commercial_pricing(decision, refs, quantity, line_total, billed)
+    combined_confidence = min(
+        float(structure_confidence or 0.55),
+        float(pricing.get("ai_confidence") or 0.55),
+    )
+    pricing["combined_confidence"] = round(combined_confidence, 2)
+    pricing["confidence_tier"] = confidence_tier(combined_confidence)
+    if pricing["confidence_tier"] == "low":
+        pricing["low_confidence_disclaimer"] = "Estimated comparison based on limited bill information."
+
+    display = build_result_display_labels(quantity, pricing["comparison_basis"], refs, line_total, pricing)
+    return {
+        "product": product,
+        "score": score,
+        "quantity": quantity,
+        "line_total": line_total,
+        "billed": billed,
+        "price_type": price_type,
+        "best_candidate": best_candidate,
+        "pack_info": pack_info,
+        "refs": refs,
+        "pricing": pricing,
+        "display": display,
+        "parse_source": parse_source,
+        "structure_confidence": structure_confidence,
+    }
+
+
+def analyze_bill(text):
+    cleaned = clean_ocr_text(text)
+    structured = gemini_bill_structure_extraction(cleaned)
+    parse_source = "rule_based"
+    structure_confidence = 0.55
+    bill_entries = []
+
+    if structured and structured.get("confidence", 0) >= STRUCTURE_CONFIDENCE_THRESHOLD:
+        parse_source = "gemini_structure"
+        structure_confidence = structured["confidence"]
+        for item in structured["items"]:
+            medicine = item["medicine"]
+            qty = item["quantity"]
+            amount = item["amount"]
+            raw_line = f"{medicine} Qty {qty} Rs {amount}"
+            bill_entries.append({
+                "raw_line": raw_line,
+                "source": parse_source,
+                "structure_confidence": structure_confidence,
+            })
+    else:
+        bill_entries = extract_rule_based_bill_lines(cleaned)
+
+    flagged = {}
+    detected_items = []
+    non_medicine_items = []
+    duplicates = []
+    seen = {}
+    low_confidence_items = 0
+
+    for entry in bill_entries:
+        processed = process_bill_line(
+            entry["raw_line"],
+            cleaned,
+            structure_confidence=entry.get("structure_confidence", structure_confidence),
+            parse_source=entry.get("source", parse_source),
+        )
+        if not processed:
+            raw = entry["raw_line"]
+            cat = categorize_entry_rule_based(raw)
+            if cat != "medicine":
+                _unused_price, _unused_price_type, qty, line_total = extract_billing_info(raw)
+                if line_total and line_total > 0:
+                    non_medicine_items.append({
+                        "name": raw[:100].strip(),
+                        "category_type": cat,
+                        "quantity": qty or 1,
+                        "line_total": round(line_total, 2),
+                    })
+            continue
+
+        product = processed["product"]
+        pricing = processed["pricing"]
+        display = processed["display"]
+        quantity = processed["quantity"]
+        line_total = processed["line_total"]
+        billed = processed["billed"]
+        price_type = processed["price_type"]
+        score = processed["score"]
+        pack_info = processed["pack_info"]
+        refs = processed["refs"]
+
+        key = product["generic"].lower()
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] == 2:
+            duplicates.append(product["generic"])
+
+        item = {
+            "name": product["generic"],
+            "category_type": "medicine",
+            "brand": product["brand"] or "N/A",
+            "category": product["category"] or "N/A",
+            "unit": product["unit"],
+            "quantity": quantity,
+            "quantity_display": display["quantity_display"],
+            "quantity_detail": display["quantity_detail"],
+            "pack_size_display": display["pack_size_display"],
+            "bill_pack_size": refs["bill_pack_size"],
+            "csv_pack_size": refs["csv_pack_size"],
+            "pack_size_source": refs["pack_size_source"],
+            "price_normalized": refs.get("normalized", False),
+            "billed_display": display["billed_display"],
+            "expected_display": display["expected_display"],
+            "comparison_label": display["comparison_label"],
+            "line_total": line_total,
+            "detected_price": billed,
+            "reference_unit_price": (
+                refs["tablet_price"]
+                if pricing["comparison_basis"] == "tablet"
+                else refs["strip_price"]
+            ),
+            "expected_price": pricing["expected_price"],
+            "expected_line_total": pricing["expected_line_total"],
+            "billed_price": pricing["billed_price"],
+            "unit_difference": pricing["difference"],
+            "difference": pricing["total_difference"],
+            "overpricing_percentage": pricing["overpricing_percentage"],
+            "comparison_basis": pricing["comparison_basis"],
+            "ai_confidence": pricing["ai_confidence"],
+            "combined_confidence": pricing["combined_confidence"],
+            "confidence_tier": pricing["confidence_tier"],
+            "low_confidence_disclaimer": pricing.get("low_confidence_disclaimer", ""),
+            "interpretation_reasoning": pricing["interpretation_reasoning"],
+            "parse_source": processed["parse_source"],
+            "match_score": score,
+            "note": (
+                f"Unit price calculated as Rs {line_total:.2f} / {quantity}"
+                if price_type == "calculated_unit_price" and line_total is not None
+                else "Compared using detected unit price"
+            ),
+            "jan_aushadhi_note": (
+                f"{product['generic']} is available at Jan Aushadhi Kendras at "
+                f"Rs {refs['per_tablet_price']:.2f} per unit (CSV MRP: Rs {refs['csv_mrp']:.2f})."
+            ) if refs.get("per_tablet_price") and refs["per_tablet_price"] > 0 else "",
+            "jan_aushadhi_savings": max(round(pricing["total_difference"], 2), 0) if pricing.get("total_difference") else 0,
+        }
+        detected_items.append(item)
+
+        is_overpriced = pricing["total_difference"] is not None and pricing["total_difference"] > 0
+        if pricing["confidence_tier"] == "low":
+            low_confidence_items += 1
+        if is_overpriced and pricing["confidence_tier"] != "low":
+            flagged[product["generic"]] = {
+                "expected": pricing["expected_price"],
+                "billed": pricing["billed_price"],
+                "quantity": quantity,
+                "line_total": line_total,
+                "expected_line_total": pricing["expected_line_total"],
+                "extra": pricing["total_difference"],
+                "overpricing_percentage": pricing["overpricing_percentage"],
+                "comparison_basis": pricing["comparison_basis"],
+                "ai_confidence": pricing["combined_confidence"],
+                "confidence_tier": pricing["confidence_tier"],
+                "category": item["category"],
+                "note": (
+                    f"Line total is Rs {pricing['total_difference']:.2f} above reference pricing "
+                    f"({pricing['comparison_basis']} basis)."
+                ),
+            }
+
+    invalid_pricing = [item["name"] for item in detected_items if item["detected_price"] is None or item["detected_price"] <= 0]
+    category_counts: dict = {}
+    for _i in detected_items:
+        _c = _i.get("category_type", "medicine")
+        category_counts[_c] = category_counts.get(_c, 0) + 1
+    for _i in non_medicine_items:
+        _c = _i.get("category_type", "other")
+        category_counts[_c] = category_counts.get(_c, 0) + 1
+    report = {
+        "detected_items": detected_items,
+        "non_medicine_items": non_medicine_items,
+        "category_breakdown": category_counts,
+        "duplicates": duplicates,
+        "missing_medicine_detection": "No obvious medicine names were detected." if not detected_items else "",
+        "invalid_pricing": invalid_pricing,
+        "parse_source": parse_source,
+        "structure_confidence": structure_confidence,
+        "low_confidence_items": low_confidence_items,
+        "summary": {
+            "total_detected": len(detected_items),
+            "overpriced_count": len(flagged),
+            "estimated_savings": round(sum(item["extra"] for item in flagged.values()), 2),
+            "low_confidence_disclaimer": (
+                "Estimated comparison based on limited bill information."
+                if low_confidence_items
+                else ""
+            ),
+        },
+    }
+    return flagged, report
+
+
+HOSPITAL_TYPES = {
+    "government": "Government Hospital",
+    "private": "Private Hospital",
+    "pharmacy": "Pharmacy",
+}
+
+
+def _safe_positive_float(value, default=1.0):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number > 0 else default
+
+
+def apply_user_pricing_inputs(report, user_items, hospital_type):
+    hospital_key = hospital_type if hospital_type in HOSPITAL_TYPES else "private"
+    user_lookup = {}
+    for entry in user_items or []:
+        try:
+            index = int(entry.get("index"))
+        except (TypeError, ValueError):
+            continue
+        user_lookup[index] = {
+            "quantity": _safe_positive_float(entry.get("quantity"), 1.0),
+        }
+
+    flagged = {}
+    detected_items = report.get("detected_items", [])
+    low_confidence_items = 0
+
+    for index, item in enumerate(detected_items):
+        quantity = user_lookup.get(index, {}).get("quantity", _safe_positive_float(item.get("quantity"), 1.0))
+        original_quantity = _safe_positive_float(item.get("quantity"), 1.0)
+        line_total = item.get("line_total")
+        if line_total is None:
+            line_total = item.get("billed_price") or item.get("detected_price") or 0
+        line_total = round(_safe_positive_float(line_total, 0.0), 2)
+        comparison_basis = item.get("comparison_basis") or "strip"
+        reference_unit_price = item.get("reference_unit_price")
+        if reference_unit_price is None and comparison_basis == "line_total":
+            reference_unit_price = round(float(item.get("expected_line_total") or 0) / original_quantity, 4)
+        if reference_unit_price is None:
+            reference_unit_price = item.get("expected_price") or 0
+
+        if hospital_key == "government":
+            billed_price = round(line_total / quantity, 2) if quantity else line_total
+            expected_line_total = round(float(reference_unit_price or 0) * quantity, 2)
+            expected_price = round(float(reference_unit_price or 0), 2)
+            confidence_tier_value = item.get("confidence_tier", "medium")
+            interpretation = "Government hospital pricing compared directly with Jan Aushadhi reference pricing; no markup added."
+        else:
+            expected_price = round(float(reference_unit_price or 0), 2)
+            expected_line_total = round(expected_price * quantity, 2)
+            billed_price = round(line_total / quantity, 2) if quantity else line_total
+            confidence_tier_value = item.get("confidence_tier", "medium")
+            interpretation = item.get("interpretation_reasoning", "")
+
+        total_difference = round(line_total - expected_line_total, 2)
+        unit_difference = round(billed_price - expected_price, 2)
+        overpricing_percentage = (
+            round((total_difference / expected_line_total) * 100, 2)
+            if expected_line_total and total_difference > 0
+            else 0
+        )
+        status = "Possible Overpricing" if total_difference > 0 else "Price appears reasonable."
+
+        item.update({
+            "quantity": quantity,
+            "quantity_display": f"{quantity:g} units",
+            "quantity_detail": "Quantity confirmed by user after OCR extraction.",
+            "comparison_label": f"Hospital type: {HOSPITAL_TYPES[hospital_key]}",
+            "line_total": line_total,
+            "billed_price": billed_price,
+            "expected_price": expected_price,
+            "expected_line_total": expected_line_total,
+            "expected_display": f"Rs {expected_line_total:.2f} for {quantity:g} units (Rs {expected_price:.2f} per unit)",
+            "billed_display": f"Rs {line_total:.2f} total - Rs {billed_price:.2f} per unit",
+            "unit_difference": unit_difference,
+            "difference": total_difference,
+            "overpricing_percentage": overpricing_percentage,
+            "pricing_status": status,
+            "hospital_type": HOSPITAL_TYPES[hospital_key],
+            "interpretation_reasoning": interpretation,
+            "jan_aushadhi_savings": max(total_difference, 0),
+        })
+
+        if confidence_tier_value == "low":
+            low_confidence_items += 1
+        if total_difference > 0 and confidence_tier_value != "low":
+            flagged[item["name"]] = {
+                "expected": expected_price,
+                "billed": billed_price,
+                "quantity": quantity,
+                "line_total": line_total,
+                "expected_line_total": expected_line_total,
+                "extra": total_difference,
+                "overpricing_percentage": overpricing_percentage,
+                "comparison_basis": comparison_basis,
+                "ai_confidence": item.get("combined_confidence"),
+                "confidence_tier": confidence_tier_value,
+                "category": item.get("category"),
+                "note": status,
+            }
+
+    summary = report.setdefault("summary", {})
+    summary.update({
+        "total_detected": len(detected_items),
+        "overpriced_count": len(flagged),
+        "estimated_savings": round(sum(item["extra"] for item in flagged.values()), 2),
+        "low_confidence_disclaimer": (
+            "Estimated comparison based on limited bill information."
+            if low_confidence_items
+            else ""
+        ),
+    })
+    report["hospital_type"] = HOSPITAL_TYPES[hospital_key]
+    report["quantity_reviewed"] = True
+    return flagged, report
+
+
+def gemini_bill_context(text):
+    try:
+        prompt = (
+            "Review this medical bill OCR text. In two short paragraphs, say likely treatment category "
+            "and whether common items may be covered under Ayushman Bharat PM-JAY. Avoid firm diagnosis.\n\n"
+            f"{text[:5000]}"
+        )
+        analysis = extract_gemini_text(_gemini_generate_with_fallback(prompt))
+        if not analysis:
+            raise RuntimeError("Gemini returned an empty bill analysis")
+        ayushman = extract_gemini_text(_gemini_generate_with_fallback(
+            "From this analysis, give a cautious PM-JAY coverage note in 2-3 lines:\n" + analysis[:2000]
+        ))
+        illness = analysis.splitlines()[0] if analysis else "N/A"
+        return illness, ayushman or "Coverage depends on PM-JAY package rules and whether the hospital is empanelled.", analysis
+    except Exception as exc:
+        app.logger.warning("Gemini bill context unavailable: %s", exc)
+        return (
+            "N/A",
+            "Coverage depends on PM-JAY package rules and whether the hospital is empanelled.",
+            fallback_chat_response("bill coverage"),
+        )
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    radius = 6371
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+    return round(2 * radius * asin(sqrt(a)), 2)
+
+
+def _tag_text(tags):
+    return " ".join(str(value) for value in tags.values() if value).lower()
+
+
+def _hospital_address(tags):
+    full_address = tags.get("addr:full")
+    if full_address:
+        return full_address
+    parts = [
+        tags.get("addr:housenumber"),
+        tags.get("addr:street"),
+        tags.get("addr:suburb"),
+        tags.get("addr:city") or tags.get("addr:town") or tags.get("addr:village"),
+        tags.get("addr:state"),
+        tags.get("addr:postcode"),
+    ]
+    return ", ".join(part for part in parts if part) or "Address not available"
+
+
+def _fallback_hospital_links(lat, lon, ayushman_only=False):
+    links = []
+    if ayushman_only:
+        links.append({
+            "name": "PM-JAY Empanelled Hospital Search",
+            "address": "Official PM-JAY hospital search portal. Select your state/district there to verify empanelment.",
+            "distance": 0,
+            "contact": "Not available",
+            "type": "Official Portal",
+            "lat": lat,
+            "lon": lon,
+            "ayushman": True,
+            "ayushman_note": "Official portal for PM-JAY hospital verification",
+            "map_url": PMJAY_HOSPITAL_SEARCH_URL,
+        })
+    links.extend([
+        {
+            "name": "Search nearby hospitals on Google Maps",
+            "address": "External map search using your current coordinates.",
+            "distance": 0,
+            "contact": "Not available",
+            "type": "External Search",
+            "lat": lat,
+            "lon": lon,
+            "ayushman": False,
+            "ayushman_note": "Ayushman status not verified",
+            "map_url": GOOGLE_MAPS_HOSPITAL_SEARCH_URL.format(lat=lat, lon=lon),
+        },
+        {
+            "name": "Search nearby hospitals on OpenStreetMap",
+            "address": "External OpenStreetMap search using your current coordinates.",
+            "distance": 0,
+            "contact": "Not available",
+            "type": "External Search",
+            "lat": lat,
+            "lon": lon,
+            "ayushman": False,
+            "ayushman_note": "Ayushman status not verified",
+            "map_url": OSM_HOSPITAL_SEARCH_URL.format(lat=lat, lon=lon),
+        },
+    ])
+    return links
+
+
+def _fetch_overpass_payload(query):
+    data = urlencode({"data": query}).encode()
+    last_error = None
+    for endpoint in (
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+    ):
+        req = Request(endpoint, data=data, headers={"User-Agent": "AyushScan/1.0"})
+        try:
+            with urlopen(req, timeout=20) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            last_error = exc
+            app.logger.warning("Overpass endpoint failed (%s): %s", endpoint, exc)
+    raise RuntimeError(f"All Overpass endpoints failed: {last_error}")
+
+
+def fetch_overpass_hospitals(lat, lon, radius=7000):
+    detailed_query = f"""
+    [out:json][timeout:25];
+    (
+      node["amenity"="hospital"](around:{radius},{lat},{lon});
+      way["amenity"="hospital"](around:{radius},{lat},{lon});
+      relation["amenity"="hospital"](around:{radius},{lat},{lon});
+      node["amenity"="clinic"](around:{radius},{lat},{lon});
+      way["amenity"="clinic"](around:{radius},{lat},{lon});
+      relation["amenity"="clinic"](around:{radius},{lat},{lon});
+      node["amenity"="doctors"](around:{radius},{lat},{lon});
+      way["amenity"="doctors"](around:{radius},{lat},{lon});
+      relation["amenity"="doctors"](around:{radius},{lat},{lon});
+      node["healthcare"~"hospital|clinic|doctor|centre|center"](around:{radius},{lat},{lon});
+      way["healthcare"~"hospital|clinic|doctor|centre|center"](around:{radius},{lat},{lon});
+      relation["healthcare"~"hospital|clinic|doctor|centre|center"](around:{radius},{lat},{lon});
+    );
+    out center tags;
+    """
+    simple_query = f"""
+    [out:json][timeout:15];
+    (
+      node["amenity"~"hospital|clinic|doctors"](around:{radius},{lat},{lon});
+      way["amenity"~"hospital|clinic|doctors"](around:{radius},{lat},{lon});
+      node["healthcare"](around:{radius},{lat},{lon});
+      way["healthcare"](around:{radius},{lat},{lon});
+    );
+    out center tags;
+    """
+    try:
+        payload = _fetch_overpass_payload(detailed_query)
+    except Exception as exc:
+        app.logger.warning("Detailed hospital lookup failed, trying simple lookup: %s", exc)
+        payload = _fetch_overpass_payload(simple_query)
+    hospitals = {}
+    for element in payload.get("elements", []):
+        tags = element.get("tags", {})
+        hlat = element.get("lat") or element.get("center", {}).get("lat")
+        hlon = element.get("lon") or element.get("center", {}).get("lon")
+        if not hlat or not hlon:
+            continue
+        name = tags.get("name") or "Unnamed Hospital"
+        key = (name.lower(), round(float(hlat), 4), round(float(hlon), 4))
+        if key in hospitals:
+            continue
+        text = _tag_text(tags)
+        hayushman = any(hint in text for hint in AYUSHMAN_HINTS)
+        facility_type = tags.get("amenity") or tags.get("healthcare") or "healthcare"
+        hospitals[key] = {
+            "name": name,
+            "address": _hospital_address(tags),
+            "distance": haversine_km(float(lat), float(lon), float(hlat), float(hlon)),
+            "contact": tags.get("phone") or tags.get("contact:phone") or "Not available",
+            "type": facility_type.title(),
+            "lat": hlat,
+            "lon": hlon,
+            "ayushman": hayushman,
+            "ayushman_note": "Possible match from OpenStreetMap tags" if hayushman else "Not confirmed in OpenStreetMap tags",
+            "map_url": f"https://www.openstreetmap.org/?mlat={hlat}&mlon={hlon}#map=16/{hlat}/{hlon}",
+        }
+    return sorted(hospitals.values(), key=lambda h: h["distance"])[:30]
+
+
+def fetch_nearby_hospitals(lat, lon):
+    for radius in (1000, 3000, 7000, 15000):
+        hospitals = fetch_overpass_hospitals(lat, lon, radius=radius)
+        if hospitals:
+            return hospitals, radius
+    return [], 15000
+
+
+# State-specific scheme database
+_STATE_SCHEMES = {
+    "maharashtra": {"name": "Mahatma Jyotiba Phule Jan Arogya Yojana", "description": "₹5 lakh cover for 1000+ procedures in Maharashtra empanelled hospitals.", "eligibility": "Maharashtra residents — yellow/orange/white ration card holders", "website": "https://nhm.maharashtra.gov.in/en/"},
+    "tamil nadu": {"name": "CM Comprehensive Health Insurance (CMCHIS)", "description": "₹5 lakh coverage per year for government hospital treatment in TN.", "eligibility": "Tamil Nadu families with income below ₹72,000/year", "website": "https://www.cmchistn.com/"},
+    "karnataka": {"name": "Arogya Karnataka", "description": "Free treatment up to ₹5 lakh in government hospitals in Karnataka.", "eligibility": "Karnataka residents below ₹1.5 lakh annual income", "website": "https://arogya.karnataka.gov.in/"},
+    "west bengal": {"name": "Swasthya Sathi", "description": "₹5 lakh health cover per family per year across all Bengal government hospitals.", "eligibility": "All West Bengal families — no income bar", "website": "https://swasthyasathi.gov.in/"},
+    "telangana": {"name": "Aarogyasri (Telangana)", "description": "Covers 3,000+ medical procedures for BPL families in Telangana.", "eligibility": "BPL ration card holders in Telangana", "website": "https://www.aarogyasri.telangana.gov.in/"},
+    "andhra pradesh": {"name": "YSR Aarogyasri", "description": "₹5 lakh health cover per year for eligible AP families.", "eligibility": "Families with white or yellow ration card in Andhra Pradesh", "website": "https://ysrarogyasri.ap.gov.in/"},
+    "rajasthan": {"name": "Chiranjeevi Swasthya Bima Yojana", "description": "₹25 lakh cashless cover at empanelled hospitals in Rajasthan.", "eligibility": "All Rajasthan families — free for BPL/small farmers", "website": ""},
+    "gujarat": {"name": "Mukhyamantri Amrutum (MA) Yojana", "description": "₹5 lakh health cover for secondary and tertiary care in Gujarat.", "eligibility": "Gujarat families with income below ₹1.20 lakh/year", "website": "https://magmayojana.gujarat.gov.in/"},
+    "delhi": {"name": "Delhi Arogya Kosh", "description": "Free treatment at Delhi government hospitals; covers major surgeries.", "eligibility": "Delhi residents — BPL families prioritised", "website": ""},
+    "kerala": {"name": "Karunya Arogya Suraksha Padhathi", "description": "₹5 lakh per family per year for BPL families in Kerala.", "eligibility": "Kerala BPL families — below poverty line card holders", "website": "https://kasp.kerala.gov.in/"},
+}
+
+_CASTE_SCHEMES = {
+    "sc": {"name": "National SC/ST Health Scheme (MoSJE)", "description": "Additional health benefits and waiver of co-payment under PM-JAY for SC families.", "eligibility": "Scheduled Caste families — caste certificate required", "website": "https://socialjustice.gov.in/"},
+    "st": {"name": "Tribal Health Mission", "description": "Dedicated health centres and PM-JAY priority enrolment for Scheduled Tribe families.", "eligibility": "Scheduled Tribe families — tribal certificate required", "website": "https://tribal.nic.in/"},
+    "ews": {"name": "EWS Health Coverage under PM-JAY", "description": "Economically Weaker Sections may be eligible for relevant government health schemes depending on state and household criteria.", "eligibility": "Check eligibility on the PM-JAY beneficiary portal or with the local health office.", "website": PMJAY_ELIGIBILITY_URL},
+}
+
+
+def _rule_based_schemes(illness, user_profile=None):
+    illness_lower = (illness or "").lower()
+    profile = user_profile or {}
+    state = (profile.get("state") or "").lower().strip().replace("_", " ")
+    caste = (profile.get("caste_category") or "general").lower()
+    income = (profile.get("annual_income") or "not_specified").lower()
+    schemes = []
+
+    # ── Disease-specific central schemes ─────────────────────────────────────
+    if any(k in illness_lower for k in ("cancer", "tumor", "oncolog", "malignant")):
+        schemes.append({"name": "Rashtriya Arogya Nidhi (RAN)", "description": "Financial assistance for BPL patients with life-threatening diseases including cancer.", "eligibility": "Below Poverty Line (BPL) families — apply via district hospital", "website": MOHFW_URL})
+    if any(k in illness_lower for k in ("heart", "cardiac", "coronary", "bypass")):
+        schemes.append({"name": "PM-JAY — Cardiac Care Package", "description": "PM-JAY may cover eligible cardiac procedures at empanelled hospitals.", "eligibility": "Check eligibility on the PM-JAY beneficiary portal and confirm package availability with the hospital.", "website": PMJAY_ELIGIBILITY_URL})
+    if any(k in illness_lower for k in ("kidney", "renal", "dialysis", "transplant")):
+        schemes.append({"name": "PM-JAY — Renal Care Package", "description": "PM-JAY may cover eligible kidney dialysis and renal procedures at empanelled hospitals.", "eligibility": "Check eligibility on the PM-JAY beneficiary portal and confirm package availability with the hospital.", "website": PMJAY_ELIGIBILITY_URL})
+    if any(k in illness_lower for k in ("maternal", "delivery", "pregnancy", "antenatal", "prenatal")):
+        schemes.append({"name": "Pradhan Mantri Matru Vandana Yojana (PMMVY)", "description": "₹5,000 cash benefit for first live birth — covers ante-natal care and nutrition.", "eligibility": "Pregnant and lactating women for first live birth", "website": "https://pmmvy.wcd.gov.in/"})
+
+    # ── Caste-based additions ─────────────────────────────────────────────────
+    if caste in ("sc", "st", "ews") and caste in _CASTE_SCHEMES:
+        schemes.append(_CASTE_SCHEMES[caste])
+
+    # ── State-specific scheme ─────────────────────────────────────────────────
+    if state and state in _STATE_SCHEMES:
+        schemes.append(_STATE_SCHEMES[state])
+
+    # ── Income-based eligibility note ─────────────────────────────────────────
+    income_label = ""
+    if income in ("below_1lakh", "1_2lakh"):
+        income_label = "Your income range may make you eligible for PM-JAY or state schemes. Check the PM-JAY beneficiary portal."
+    elif income in ("2_5lakh",):
+        income_label = "You may qualify for state-specific schemes. Check with your district hospital."
+
+    # ── PM-JAY always included ────────────────────────────────────────────────
+    schemes.append({
+        "name": "Ayushman Bharat PM-JAY",
+        "description": f"₹5 lakh cover per year for eligible secondary and tertiary hospitalisation.{' ' + income_label if income_label else ''}",
+        "eligibility": f"SECC 2011 families and state-nominated beneficiaries — verify eligibility online. For empanelled hospitals, check {PMJAY_HOSPITAL_SEARCH_URL}",
+        "website": PMJAY_ELIGIBILITY_URL,
+    })
+    # Deduplicate by name
+    seen_names: set = set()
+    unique: list = []
+    for s in schemes:
+        if s["name"] not in seen_names:
+            seen_names.add(s["name"])
+            unique.append(s)
+    return unique[:4]
+
+
+def suggest_government_schemes(illness, flagged, report, user_profile=None):
+    if not illness or illness in ("N/A", ""):
+        return _rule_based_schemes("", user_profile)
+    try:
+        if genai is None or not os.getenv("GOOGLE_API_KEY"):
+            return _rule_based_schemes(illness, user_profile)
+        profile = user_profile or {}
+        state = profile.get("state", "")
+        caste = profile.get("caste_category", "general")
+        income = profile.get("annual_income", "not_specified")
+        flagged_names = list(flagged.keys())[:5] if flagged else []
+        prompt = (
+            "Based on the patient profile and medical context below, suggest up to 3 relevant "
+            "Indian government health schemes the patient may be eligible for. "
+            "Include Ayushman Bharat PM-JAY if applicable. "
+            f"For PM-JAY eligibility use {PMJAY_ELIGIBILITY_URL}. "
+            f"For PM-JAY hospital search use {PMJAY_HOSPITAL_SEARCH_URL}. "
+            "Do not use pmjay.gov.in or nhm.gov.in if a more specific working portal is available. "
+            "Use accurate government website URLs only when you are confident. "
+            "Return ONLY valid JSON:\n"
+            '{"schemes": [{"name": "...", "description": "...", "eligibility": "...", "website": "https://..."}]}\n\n'
+            f"State: {state or 'not specified'}\n"
+            f"Caste category: {caste}\n"
+            f"Annual income: {income}\n"
+            f"Treatment context: {illness[:400]}\n"
+            f"Flagged medicines: {', '.join(flagged_names) or 'none'}\n"
+        )
+        raw = gemini_generate_json(prompt)
+        payload = parse_json_payload(raw)
+        if isinstance(payload, dict) and isinstance(payload.get("schemes"), list) and payload["schemes"]:
+            gemini_schemes = [s for s in payload["schemes"][:3] if isinstance(s, dict) and s.get("name")]
+            if gemini_schemes:
+                return gemini_schemes
+    except Exception as exc:
+        app.logger.warning("Scheme suggestion failed: %s", exc)
+    return _rule_based_schemes(illness, user_profile)
+
+
+@app.route("/api/status")
+def api_status():
+    key = os.getenv("GOOGLE_API_KEY", "")
+    key_ok = bool(key and (key.startswith("AIza") or key.startswith("AQ.")) and len(key) > 10)
+    email_provider = _email_provider_name()
+    email_ok = email_provider != "not_configured"
+    gemini_test = ""
+    if genai and key_ok:
+        try:
+            client = get_gemini_client()
+            client.models.generate_content(model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"), contents="ping")
+            gemini_test = "ok"
+        except Exception as exc:
+            gemini_test = str(exc)
+    elif not key:
+        gemini_test = "GOOGLE_API_KEY not set"
+    elif not key_ok:
+        gemini_test = "GOOGLE_API_KEY is not a valid Gemini key — it must start with 'AIza' or 'AQ.'. Get one at https://aistudio.google.com/apikey"
+    else:
+        gemini_test = "google-genai not installed"
+    return jsonify({
+        "google_api_key_set": bool(key),
+        "google_api_key_format_ok": key_ok,
+        "google_api_key_hint": f"{key[:6]}…" if key else "not set",
+        "gemini_model": os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+        "gemini_ping": gemini_test,
+        "email_configured": email_ok,
+        "email_provider": email_provider,
+        "database_path": str(DATABASE),
+        "tesseract_path": os.getenv("TESSERACT_CMD", "default"),
+        "tesseract_python_package_installed": pytesseract is not None,
+        "pdf_renderer_installed": pdfium is not None,
+        "easyocr_installed": _easyocr_module is not None,
+        "products_loaded": len(PRODUCTS),
+    })
+
+
+@app.route("/api/email-status")
+def api_email_status():
+    brevo_key = os.getenv("BREVO_API_KEY", "")
+    sender_email = os.getenv("BREVO_SENDER_EMAIL", "")
+    contact_email = os.getenv("CONTACT_EMAIL", "")
+    return jsonify({
+        "email_provider": _email_provider_name(),
+        "brevo_api_key_set": bool(brevo_key),
+        "brevo_api_key_hint": f"{brevo_key[:4]}...{brevo_key[-4:]}" if len(brevo_key) >= 8 else "not set",
+        "brevo_sender_email_set": bool(sender_email),
+        "brevo_sender_email": sender_email,
+        "brevo_sender_name": os.getenv("BREVO_SENDER_NAME", "Nivara"),
+        "contact_email_set": bool(contact_email),
+        "contact_email": contact_email,
+        "email_reply_to_set": bool(os.getenv("EMAIL_REPLY_TO")),
+    })
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/about")
+def about():
+    return render_template("about.html")
+
+
+@app.route("/contact", methods=["POST"])
+def contact():
+    name = (request.form.get("name") or "").strip()[:200]
+    email = (request.form.get("email") or "").strip()[:200]
+    message = (request.form.get("message") or "").strip()[:2000]
+
+    contact_to = os.getenv("CONTACT_EMAIL")
+    if not contact_to or _email_provider_name() == "not_configured":
+        flash(_("Contact form is not configured. Please email us directly."), "danger")
+        return redirect(url_for("about"))
+
+    try:
+        send_email(
+            contact_to,
+            f"Nivara Contact - {name}",
+            f"Name: {name}\nEmail: {email}\n\nMessage:\n{message}",
+        )
+        app.logger.info("Contact form submitted from %s", email)
+        flash(_("Message sent successfully!"), "success")
+    except Exception as exc:
+        app.logger.exception("Contact form email failed")
+        flash(_("Could not send message. Please try again later."), "danger")
+
+    return redirect(url_for("about"))
+
+
+@app.route("/signup", methods=["GET", "POST"])
+def signup():
+    if request.method == "GET":
+        return render_template("signup.html")
+    data = request.get_json(silent=True) or {}
+    required = ["firstName", "lastName", "username", "email", "password"]
+    if not all(data.get(field) for field in required):
+        return jsonify(success=False, message=_("Please fill all required fields.")), 400
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.execute(
+                "INSERT INTO users (first_name, last_name, username, email, password, preferred_language) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    data["firstName"].strip(),
+                    data["lastName"].strip(),
+                    data["username"].strip(),
+                    data["email"].strip().lower(),
+                    generate_password_hash(data["password"]),
+                    normalize_locale(session.get("language")),
+                ),
+            )
+            conn.commit()
+            session["user_id"] = cursor.lastrowid
+        return jsonify(success=True, redirect_url="/dashboard")
+    except sqlite3.IntegrityError:
+        return jsonify(success=False, message=_("Email or username already registered.")), 409
+    except sqlite3.Error as exc:
+        app.logger.exception("Signup database error")
+        return jsonify(success=False, message=_("Signup failed because the database is not ready: %(reason)s", reason=str(exc))), 500
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "GET":
+        return render_template("login.html")
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+    # Rate limit: 10 login attempts per email per minute
+    if not check_rate_limit(f"login:{email}", max_requests=10, window_sec=60):
+        return jsonify(success=False, message=_("Too many login attempts. Please wait 1 minute.")), 429
+    try:
+        with get_db_connection() as conn:
+            user = conn.execute("SELECT id, password, preferred_language FROM users WHERE email = ?", (email,)).fetchone()
+            if user and is_password_valid(user["password"], password):
+                upgrade_password_if_plaintext(conn, user["id"], user["password"], password)
+                session["user_id"] = user["id"]
+                session["language"] = normalize_locale(user["preferred_language"] or session.get("language"))
+                return jsonify(success=True, redirect_url="/dashboard")
+    except sqlite3.Error as exc:
+        app.logger.exception("Login database error")
+        return jsonify(success=False, message=_("Login failed because the database is not ready: %(reason)s", reason=str(exc))), 500
+    return jsonify(success=False, message=_("Invalid credentials")), 401
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("index", message=_("Logged out successfully")))
+
+
+@app.route("/set_language", methods=["POST"])
+def set_language():
+    selected = normalize_locale(request.form.get("language"))
+    session["language"] = selected
+    if "user_id" in session:
+        with get_db_connection() as conn:
+            conn.execute("UPDATE users SET preferred_language = ? WHERE id = ?", (selected, session["user_id"]))
+            conn.commit()
+    return redirect(request.referrer or url_for("dashboard"))
+
+
+@app.route("/dashboard")
+def dashboard():
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+    user_id = session["user_id"]
+    with get_db_connection() as conn:
+        user = conn.execute(
+            "SELECT username, email, first_name, last_name, preferred_language, state, caste_category, annual_income FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+        scans = conn.execute("SELECT id, filename, flagged, savings, timestamp FROM scans WHERE user_id = ? ORDER BY timestamp DESC LIMIT 50", (user_id,)).fetchall()
+        chat_count = conn.execute("SELECT COUNT(*) FROM chat_history WHERE user_id = ?", (user_id,)).fetchone()[0]
+        savings = conn.execute("SELECT COALESCE(SUM(savings), 0) FROM scans WHERE user_id = ?", (user_id,)).fetchone()[0]
+        care_plans = conn.execute("SELECT COUNT(*) FROM payment_orders WHERE user_id = ?", (user_id,)).fetchone()[0]
+    metrics = {
+        "total_scans": len(scans),
+        "recent_scans": len(scans[:5]),
+        "chat_count": chat_count,
+        "savings": round(float(savings or 0), 2),
+        "care_plans": care_plans,
+    }
+    return render_template("dashboard.html", user=user, scans=scans, metrics=metrics)
+
+
+@app.route("/merchant-workspace")
+def merchant_workspace():
+    """Demo merchant view: the marketplace side of Nivara's agentic workflow."""
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            "SELECT merchant_name, status, amount, currency, created_at FROM payment_orders "
+            "WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
+            (session["user_id"],),
+        ).fetchall()
+    merchant_rows = []
+    for merchant in DEMO_MERCHANTS:
+        merchant_orders = [row for row in rows if row["merchant_name"] == merchant["name"]]
+        completed = [row for row in merchant_orders if row["status"] == "COMPLETED"]
+        gross_value = round(sum(float(row["amount"] or 0) for row in completed), 2)
+        merchant_rows.append({
+            "merchant": merchant["name"],
+            "positioning": merchant["tagline"],
+            "deliveryWindow": merchant["eta"],
+            "orders": len(merchant_orders),
+            "captured": len(completed),
+            "grossValue": gross_value,
+            "readiness": "Checkout ready",
+        })
+    return render_template("merchant_workspace.html", merchant_rows=merchant_rows)
+
+
+@app.route("/chatbot")
+def chatbot_page():
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+    with get_db_connection() as conn:
+        user = conn.execute("SELECT username, email, first_name, last_name FROM users WHERE id = ?", (session["user_id"],)).fetchone()
+        history = conn.execute(
+            "SELECT user_message, bot_response, language, mode, timestamp FROM chat_history WHERE user_id = ? ORDER BY timestamp ASC LIMIT 100",
+            (session["user_id"],),
+        ).fetchall()
+    return render_template("chatbot.html", user=user, history=history)
+
+
+@app.route("/chatbot/message", methods=["POST"])
+def chatbot_message():
+    if "user_id" not in session:
+        return jsonify(success=False, reply=_("Please log in first."), source="error"), 401
+    data = request.get_json(silent=True) or {}
+    user_input = (data.get("message") or "").strip()
+    mode = data.get("mode", "gemini")
+    language = detect_language(user_input)
+    if not user_input:
+        reply = fallback_chat_response("", language, mode)
+        return jsonify(success=False, reply=reply, language=language, mode=mode, source="fallback"), 400
+
+    source = "fallback"
+    reply = ""
+    error_reason = ""
+    try:
+        if mode == "price":
+            reply = find_medicine_price(user_input)
+            if reply:
+                source = "price_lookup"
+            else:
+                reply = fallback_chat_response(user_input, language, mode)
+        else:
+            reply = ask_gemini(user_input, language, user_id=session["user_id"])
+            source = "gemini"
+    except Exception as exc:
+        error_reason = str(exc)
+        app.logger.warning("Chatbot fallback (%s): %s", type(exc).__name__, exc)
+        reply = fallback_chat_response(user_input, language, mode)
+        source = "fallback"
+
+    save_chat(session["user_id"], user_input, reply, language, mode)
+    return jsonify(
+        success=True,
+        reply=reply,
+        language=language,
+        mode=mode,
+        source=source,
+        error_reason=error_reason if source == "fallback" else "",
+    )
+
+
+@app.route("/hospitals/nearby")
+def hospitals_nearby():
+    if "user_id" not in session:
+        return jsonify(success=False, message=_("Unauthorized")), 401
+    try:
+        lat = float(request.args.get("lat"))
+        lon = float(request.args.get("lon"))
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            return jsonify(success=False, message=_("Invalid location coordinates."), hospitals=[]), 400
+        ayushman_only = request.args.get("ayushman") == "1"
+        hospitals, radius_used = fetch_nearby_hospitals(lat, lon)
+        if ayushman_only:
+            ayushman_hospitals = [hospital for hospital in hospitals if hospital["ayushman"]]
+            if ayushman_hospitals:
+                return jsonify(success=True, hospitals=ayushman_hospitals, source="overpass", radius_used_meters=radius_used)
+            if hospitals:
+                return jsonify(
+                    success=True,
+                    hospitals=hospitals,
+                    source="overpass",
+                    radius_used_meters=radius_used,
+                    message=_("No PM-JAY-tagged hospitals were found in OpenStreetMap near you, so all nearby hospitals are shown. Verify empanelment on the official PM-JAY portal."),
+                )
+        if not hospitals:
+            return jsonify(
+                success=True,
+                hospitals=_fallback_hospital_links(lat, lon, ayushman_only=False),
+                source="fallback",
+                radius_used_meters=radius_used,
+                message=_("No hospitals were found in OpenStreetMap near this location. Use these external search links instead."),
+            )
+        return jsonify(success=True, hospitals=hospitals, source="overpass", radius_used_meters=radius_used)
+    except (TypeError, ValueError):
+        return jsonify(success=False, message=_("Invalid location coordinates."), hospitals=[]), 400
+    except Exception as exc:
+        app.logger.warning("Hospital lookup failed: %s", exc)
+        return jsonify(
+            success=True,
+            hospitals=_fallback_hospital_links(lat, lon, request.args.get("ayushman") == "1"),
+            source="fallback",
+            message=_("Live hospital lookup is temporarily unavailable. Use these external search links instead."),
+        )
+
+
+@app.route("/scan", methods=["POST"])
+def scan():
+    if "user_id" not in session:
+        return jsonify(success=False, message=_("Unauthorized access")), 401
+
+    # Rate limit: 15 scans per user per minute
+    if not check_rate_limit(f"scan:{session['user_id']}", max_requests=15, window_sec=60):
+        return jsonify(success=False, message=_("Too many scans. Please wait a moment before trying again.")), 429
+
+    file = request.files.get("file")
+    if not file or not file.filename:
+        return jsonify(success=False, message=_("No file selected")), 400
+
+    # Extension whitelist
+    suffix = Path(secure_filename(file.filename)).suffix.lower()
+    if suffix not in _ALLOWED_EXTENSIONS:
+        return jsonify(success=False, message=_("Unsupported file type. Please upload a JPG, PNG, or PDF.")), 400
+
+    filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}_{secure_filename(file.filename)}"
+    file_path = UPLOAD_FOLDER / filename
+    file.save(file_path)
+    try:
+        if file_path.suffix.lower() == ".pdf":
+            text, scan_mode = extract_pdf_text(file_path)
+            if not text:
+                if pytesseract is None or Image is None:
+                    return jsonify(
+                        success=False,
+                        message=_("This PDF needs OCR to read scanned pages, but OCR dependencies are missing. Text-based PDFs still work."),
+                    ), 500
+                if pdfium is None:
+                    return jsonify(
+                        success=False,
+                        message=_("PDF rendering support is missing. Run pip install -r requirements.txt, then restart the app."),
+                    ), 500
+                return jsonify(success=False, message=_("Could not read this PDF. Please try a clearer PDF or an image upload.")), 400
+        else:
+            if pytesseract is None or Image is None:
+                return jsonify(success=False, message=_("OCR dependencies are missing. Run pip install -r requirements.txt.")), 500
+            image = Image.open(file_path)
+            text = ocr_image_to_text(image)
+            scan_mode = "image"
+        ocr_quality = estimate_ocr_quality(text)
+        _flagged, report = analyze_bill(text)
+        report.setdefault("summary", {})["ocr_quality"] = ocr_quality
+        review_id = uuid.uuid4().hex
+        _pending_scan_store[review_id] = {
+            "user_id": session["user_id"],
+            "filename": filename,
+            "text": text,
+            "report": report,
+            "scan_mode": scan_mode,
+            "ocr_quality": ocr_quality,
+            "created_at": time.time(),
+        }
+        return jsonify(
+            success=True,
+            review_required=True,
+            review_url=url_for("review_scan", review_id=review_id),
+            message=_("OCR extraction complete. Please confirm quantities before analysis."),
+            report=report,
+            text=text,
+            scan_mode=scan_mode,
+            ocr_quality=ocr_quality,
+        )
+    except UnidentifiedImageError:
+        return jsonify(success=False, message=_("Invalid or corrupted image file.")), 400
+    except Exception as exc:
+        app.logger.exception("Scan failed")
+        return jsonify(success=False, message=_("Scan failed: %(reason)s", reason=str(exc))), 500
+    finally:
+        if file_path.exists():
+            file_path.unlink()
+
+
+@app.route("/scan/review/<review_id>", methods=["GET", "POST"])
+def review_scan(review_id):
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+    pending = _pending_scan_store.get(review_id)
+    if pending and pending.get("user_id") != session["user_id"]:
+        pending = None
+    if not pending:
+        flash(_("Scan review expired. Please upload the bill again."), "danger")
+        return redirect(url_for("dashboard"))
+
+    if request.method == "GET":
+        return render_template(
+            "review_scan.html",
+            review_id=review_id,
+            report=pending.get("report", {}),
+            hospital_types=HOSPITAL_TYPES,
+            lang=get_locale(),
+        )
+
+    report = pending.get("report", {})
+    user_items = []
+    for index, _item in enumerate(report.get("detected_items", [])):
+        user_items.append({
+            "index": index,
+            "quantity": request.form.get(f"quantity_{index}"),
+        })
+    hospital_type = request.form.get("hospital_type", "private")
+    flagged, report = apply_user_pricing_inputs(report, user_items, hospital_type)
+    illness, covered, _gemini_analysis = gemini_bill_context(pending.get("text", ""))
+    savings = report["summary"]["estimated_savings"]
+
+    with get_db_connection() as conn:
+        cursor = conn.execute(
+            "INSERT INTO scans (user_id, filename, text, flagged, report, illness, covered, savings) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                session["user_id"],
+                pending.get("filename", "reviewed_scan"),
+                pending.get("text", ""),
+                json.dumps(flagged),
+                json.dumps(report),
+                illness,
+                covered,
+                savings,
+            ),
+        )
+        conn.commit()
+        scan_id = cursor.lastrowid
+
+    _pending_scan_store.pop(review_id, None)
+    return redirect(url_for("result", scan_id=scan_id))
+
+
+@app.route("/result/<int:scan_id>")
+def result(scan_id):
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT text, flagged, report, illness, covered FROM scans WHERE id = ? AND user_id = ?",
+            (scan_id, session["user_id"]),
+        ).fetchone()
+    if not row:
+        flash(_("Scan not found."), "danger")
+        return redirect(url_for("dashboard"))
+    flagged = json.loads(row["flagged"] or "{}")
+    report = json.loads(row["report"] or "{}")
+    illness = row["illness"] or "N/A"
+    with get_db_connection() as conn:
+        uprofile = conn.execute(
+            "SELECT state, caste_category, annual_income FROM users WHERE id = ?",
+            (session["user_id"],),
+        ).fetchone()
+    user_profile = dict(uprofile) if uprofile else {}
+    schemes = suggest_government_schemes(illness, flagged, report, user_profile)
+    return render_template(
+        "result.html",
+        scan_id=scan_id,
+        flagged=flagged,
+        report=report,
+        illness=illness,
+        covered=row["covered"] or "N/A",
+        transcript=row["text"] or "",
+        scheme_info=bool(row["covered"]),
+        schemes=schemes,
+    )
+
+
+@app.route("/care-plan/<int:scan_id>")
+def care_plan(scan_id):
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT report, filename, timestamp FROM scans WHERE id = ? AND user_id = ?",
+            (scan_id, session["user_id"]),
+        ).fetchone()
+        payments = conn.execute(
+            "SELECT paypal_order_id, status, amount, currency, capture_id, merchant_name, created_at "
+            "FROM payment_orders WHERE scan_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT 5",
+            (scan_id, session["user_id"]),
+        ).fetchall()
+    if not row:
+        flash(_("Scan not found."), "danger")
+        return redirect(url_for("dashboard"))
+    report = json.loads(row["report"] or "{}")
+    plan = build_care_plan(report)
+    marketplace_offers = build_marketplace_offers(plan)
+    config = paypal_config()
+    return render_template(
+        "care_plan.html",
+        scan_id=scan_id,
+        plan=plan,
+        marketplace_offers=marketplace_offers,
+        scan_filename=row["filename"],
+        payments=payments,
+        paypal_client_id=config["client_id"],
+        paypal_currency=config["currency"],
+        paypal_configured=paypal_is_configured(),
+        paypal_environment=config["environment"],
+    )
+
+
+@app.route("/api/care-plan/<int:scan_id>/paypal-order", methods=["POST"])
+def create_paypal_order(scan_id):
+    if "user_id" not in session:
+        return jsonify(success=False, message=_("Please log in first.")), 401
+    if not paypal_is_configured():
+        return jsonify(success=False, message=_("PayPal Sandbox credentials have not been configured yet.")), 503
+    request_data = request.get_json(silent=True) or {}
+    merchant_id = str(request_data.get("merchant_id") or "").strip()
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT report FROM scans WHERE id = ? AND user_id = ?",
+            (scan_id, session["user_id"]),
+        ).fetchone()
+    if not row:
+        return jsonify(success=False, message=_("Scan not found.")), 404
+    plan = build_care_plan(json.loads(row["report"] or "{}"))
+    if not plan["items"] or plan["recommended_total"] <= 0:
+        return jsonify(success=False, message=_("This analysis has no high-confidence medicine items available for checkout.")), 400
+
+    selected_merchant = get_marketplace_offer(plan, merchant_id)
+    if not selected_merchant:
+        return jsonify(success=False, message=_("Choose a merchant offer before checkout.")), 400
+    config = paypal_config()
+    paypal_items = []
+    for item in plan["items"]:
+        offer_amount = round(float(item["recommended_amount"]) * selected_merchant["multiplier"], 2)
+        unit_amount = round(offer_amount / item["quantity"], 2)
+        paypal_items.append({
+            "name": item["name"][:127],
+            "quantity": str(item["quantity"]),
+            "unit_amount": {"currency_code": config["currency"], "value": f"{unit_amount:.2f}"},
+            "category": "PHYSICAL_GOODS",
+        })
+    # Calculate the order amount from PayPal item amounts to avoid a rounding mismatch.
+    payable_total = round(sum(float(item["unit_amount"]["value"]) * int(item["quantity"]) for item in paypal_items), 2)
+    order_payload = {
+        "intent": "CAPTURE",
+        "purchase_units": [{
+            "reference_id": f"NIVARA-{scan_id}",
+            "description": f"Nivara care plan · {selected_merchant['name']}",
+            "custom_id": f"scan:{scan_id};user:{session['user_id']}",
+            "amount": {
+                "currency_code": config["currency"],
+                "value": f"{payable_total:.2f}",
+                "breakdown": {"item_total": {"currency_code": config["currency"], "value": f"{payable_total:.2f}"}},
+            },
+            "items": paypal_items,
+        }],
+        "application_context": {"shipping_preference": "NO_SHIPPING", "user_action": "PAY_NOW"},
+    }
+    try:
+        order = _paypal_json_request(
+            "POST", "/v2/checkout/orders", order_payload, get_paypal_access_token()
+        )
+    except RuntimeError as exc:
+        return jsonify(success=False, message=str(exc)), 502
+    order_id = order.get("id")
+    if not order_id:
+        app.logger.error("PayPal create order response missing id: %s", order)
+        return jsonify(success=False, message=_("PayPal did not create an order. Please try again.")), 502
+    with get_db_connection() as conn:
+        conn.execute(
+            "INSERT INTO payment_orders (user_id, scan_id, paypal_order_id, status, amount, currency, plan_json, merchant_id, merchant_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (session["user_id"], scan_id, order_id, order.get("status", "CREATED"), payable_total, config["currency"], json.dumps(plan), selected_merchant["id"], selected_merchant["name"]),
+        )
+        conn.commit()
+    return jsonify(success=True, id=order_id)
+
+
+@app.route("/api/care-plan/<int:scan_id>/paypal-capture", methods=["POST"])
+def capture_paypal_order(scan_id):
+    if "user_id" not in session:
+        return jsonify(success=False, message=_("Please log in first.")), 401
+    payload = request.get_json(silent=True) or {}
+    order_id = str(payload.get("orderID") or "").strip()
+    if not order_id:
+        return jsonify(success=False, message=_("Missing PayPal order ID.")), 400
+    with get_db_connection() as conn:
+        payment = conn.execute(
+            "SELECT id, status FROM payment_orders WHERE scan_id = ? AND user_id = ? AND paypal_order_id = ?",
+            (scan_id, session["user_id"], order_id),
+        ).fetchone()
+    if not payment:
+        return jsonify(success=False, message=_("This PayPal order is not associated with your care plan.")), 404
+    if payment["status"] == "COMPLETED":
+        return jsonify(success=True, status="COMPLETED", message=_("Payment already recorded."))
+    try:
+        captured = _paypal_json_request(
+            "POST", f"/v2/checkout/orders/{order_id}/capture", {}, get_paypal_access_token()
+        )
+    except RuntimeError as exc:
+        return jsonify(success=False, message=str(exc)), 502
+    status = captured.get("status", "UNKNOWN")
+    capture_id = ""
+    try:
+        capture_id = captured["purchase_units"][0]["payments"]["captures"][0]["id"]
+    except (KeyError, IndexError, TypeError):
+        pass
+    with get_db_connection() as conn:
+        conn.execute(
+            "UPDATE payment_orders SET status = ?, capture_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (status, capture_id, payment["id"]),
+        )
+        conn.commit()
+    return jsonify(success=status == "COMPLETED", status=status, capture_id=capture_id, message=_("Payment captured successfully.") if status == "COMPLETED" else _("PayPal returned %(status)s.", status=status))
+
+
+@app.route("/result/<int:scan_id>/export/csv")
+def export_scan_csv(scan_id):
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT filename, report, illness, timestamp FROM scans WHERE id = ? AND user_id = ?",
+            (scan_id, session["user_id"]),
+        ).fetchone()
+    if not row:
+        flash(_("Scan not found."), "danger")
+        return redirect(url_for("dashboard"))
+    report = json.loads(row["report"] or "{}")
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([_("Nivara Care Evidence Report")])
+    writer.writerow([_("File"), row["filename"]])
+    writer.writerow([_("Date"), row["timestamp"]])
+    if row["illness"] and row["illness"] != "N/A":
+        writer.writerow([_("Treatment Context"), row["illness"]])
+    writer.writerow([])
+    writer.writerow([_("Medicine"), _("Category"), _("Quantity"), _("Billed Price (Rs)"),
+                     _("Expected Price (Rs)"), _("Overpaid (Rs)"), _("Confidence")])
+    for item in report.get("detected_items", []):
+        writer.writerow([
+            item.get("name", ""),
+            item.get("category", item.get("category_type", "Medicine")),
+            item.get("quantity", ""),
+            item.get("billed_price", ""),
+            item.get("expected_price", ""),
+            item.get("difference", 0) if item.get("difference") is not None else 0,
+            item.get("confidence_tier", ""),
+        ])
+    if report.get("non_medicine_items"):
+        writer.writerow([])
+        writer.writerow([_("Other Bill Entries"), _("Category"), _("Quantity"), _("Amount (Rs)")])
+        for item in report["non_medicine_items"]:
+            writer.writerow([item.get("name", ""), item.get("category_type", ""),
+                             item.get("quantity", ""), item.get("line_total", "")])
+    summary = report.get("summary", {})
+    writer.writerow([])
+    writer.writerow([_("Summary")])
+    writer.writerow([_("Total Medicines Detected"), summary.get("total_detected", 0)])
+    writer.writerow([_("Overpriced Items"), summary.get("overpriced_count", 0)])
+    writer.writerow([_("Estimated Savings (Rs)"), summary.get("estimated_savings", 0)])
+    buf.seek(0)
+    return Response(
+        buf.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=nivara_care_evidence_{scan_id}.csv"},
+    )
+
+
+@app.route("/result/<int:scan_id>/export/pdf")
+def export_scan_pdf(scan_id):
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+    if not _reportlab_available:
+        flash(_("PDF export requires reportlab. Run: pip install reportlab"), "danger")
+        return redirect(url_for("result", scan_id=scan_id))
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT filename, flagged, report, illness, covered, timestamp FROM scans WHERE id = ? AND user_id = ?",
+            (scan_id, session["user_id"]),
+        ).fetchone()
+    if not row:
+        flash(_("Scan not found."), "danger")
+        return redirect(url_for("dashboard"))
+    report = json.loads(row["report"] or "{}")
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
+    styles = getSampleStyleSheet()
+    green = _rl_colors.HexColor("#2db646")
+    elements = []
+    elements.append(Paragraph(_("Nivara — Care Evidence Report"), styles["Title"]))
+    elements.append(Spacer(1, 6))
+    elements.append(Paragraph(_("<b>File:</b> %(filename)s", filename=row["filename"]), styles["Normal"]))
+    elements.append(Paragraph(_("<b>Date:</b> %(timestamp)s", timestamp=row["timestamp"]), styles["Normal"]))
+    if row["illness"] and row["illness"] != "N/A":
+        elements.append(Paragraph(_("<b>Treatment:</b> %(illness)s", illness=row["illness"][:300]), styles["Normal"]))
+    elements.append(Spacer(1, 10))
+    summary = report.get("summary", {})
+    elements.append(Paragraph(_("Summary"), styles["Heading2"]))
+    sum_data = [
+        [_("Total medicines detected"), str(summary.get("total_detected", 0))],
+        [_("Overpriced items (high/medium confidence)"), str(summary.get("overpriced_count", 0))],
+        [_("Estimated savings"), _("Rs %(amount)s", amount=summary.get('estimated_savings', 0))],
+    ]
+    sum_table = Table(sum_data, colWidths=[300, 180])
+    sum_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), _rl_colors.HexColor("#f0fdf4")),
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("GRID", (0, 0), (-1, -1), 0.5, _rl_colors.grey),
+        ("PADDING", (0, 0), (-1, -1), 6),
+    ]))
+    elements.append(sum_table)
+    elements.append(Spacer(1, 10))
+    items = report.get("detected_items", [])
+    if items:
+        elements.append(Paragraph(_("Detected Medicines"), styles["Heading2"]))
+        tdata = [[_("Medicine"), _("Qty"), _("Billed (Rs)"), _("Expected (Rs)"), _("Overpaid (Rs)"), _("Confidence")]]
+        for item in items:
+            tdata.append([
+                Paragraph(item.get("name", "")[:40], styles["Normal"]),
+                str(item.get("quantity", "")),
+                str(item.get("billed_price", "N/A")),
+                str(item.get("expected_price", "N/A")),
+                str(item.get("difference", 0) if item.get("difference") is not None else 0),
+                item.get("confidence_tier", ""),
+            ])
+        med_table = Table(tdata, colWidths=[150, 35, 65, 75, 70, 65])
+        med_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), green),
+            ("TEXTCOLOR", (0, 0), (-1, 0), _rl_colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("GRID", (0, 0), (-1, -1), 0.5, _rl_colors.grey),
+            ("ALIGN", (1, 0), (-1, -1), "CENTER"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [_rl_colors.white, _rl_colors.HexColor("#f8f8f8")]),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ]))
+        elements.append(med_table)
+    if row["covered"] and row["covered"] != "N/A":
+        elements.append(Spacer(1, 10))
+        elements.append(Paragraph(_("Ayushman Bharat / PM-JAY Note"), styles["Heading2"]))
+        elements.append(Paragraph(row["covered"][:600], styles["Normal"]))
+    doc.build(elements)
+    buf.seek(0)
+    return Response(
+        buf.getvalue(),
+        mimetype="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=nivara_care_evidence_{scan_id}.pdf"},
+    )
+
+
+@app.route("/update_profile", methods=["POST"])
+def update_profile():
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+    allowed_incomes = {"not_specified", "below_1lakh", "1_2lakh", "2_5lakh", "above_5lakh"}
+    allowed_castes = {"general", "obc", "sc", "st", "ews"}
+    income = request.form.get("annual_income", "not_specified")
+    caste = request.form.get("caste_category", "general")
+    if income not in allowed_incomes:
+        income = "not_specified"
+    if caste not in allowed_castes:
+        caste = "general"
+    try:
+        with get_db_connection() as conn:
+            conn.execute(
+                "UPDATE users SET first_name=?, last_name=?, username=?, state=?, caste_category=?, annual_income=? WHERE id=?",
+                (
+                    (request.form.get("first_name") or "").strip()[:100],
+                    (request.form.get("last_name") or "").strip()[:100],
+                    (request.form.get("username") or "").strip()[:50],
+                    (request.form.get("state") or "").strip()[:100],
+                    caste,
+                    income,
+                    session["user_id"],
+                ),
+            )
+            conn.commit()
+        return redirect(url_for("dashboard", message=_("Profile updated successfully")))
+    except sqlite3.IntegrityError:
+        return redirect(url_for("dashboard", message=_("Username already taken")))
+
+
+@app.route("/change_password", methods=["POST"])
+def change_password():
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+    current = request.form.get("current_password", "")
+    confirm = request.form.get("confirm_current_password", "")
+    new = request.form.get("new_password", "")
+    confirm_new = request.form.get("confirm_new_password", "")
+    if current != confirm:
+        return redirect(url_for("dashboard", message=_("Current passwords do not match")))
+    if new != confirm_new:
+        return redirect(url_for("dashboard", message=_("New passwords do not match")))
+    with get_db_connection() as conn:
+        user = conn.execute("SELECT password FROM users WHERE id = ?", (session["user_id"],)).fetchone()
+        if not user or not is_password_valid(user["password"], current):
+            return redirect(url_for("dashboard", message=_("Incorrect current password")))
+        conn.execute("UPDATE users SET password = ? WHERE id = ?", (generate_password_hash(new), session["user_id"]))
+        conn.commit()
+    return redirect(url_for("dashboard", message=_("Password changed successfully")))
+
+
+@app.route("/forgot_password", methods=["POST"])
+def forgot_password():
+    if request.is_json:
+        email = (request.get_json(silent=True) or {}).get("email", "").strip().lower()
+    else:
+        email = request.form.get("email", "").strip().lower()
+    if not email:
+        if request.is_json:
+            return jsonify(success=False, message=_("Email is required.")), 400
+        return redirect(url_for("dashboard", message=_("Email is required.")))
+
+    # Rate limit: 5 OTP requests per email per 5 minutes
+    if not check_rate_limit(f"otp:{email}", max_requests=5, window_sec=300):
+        msg = _("Too many OTP requests. Please wait 5 minutes before requesting a new one.")
+        if request.is_json:
+            return jsonify(success=False, message=msg), 429
+        return redirect(url_for("dashboard", message=msg))
+
+    with get_db_connection() as conn:
+        user = conn.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
+        if not user:
+            if request.is_json:
+                return jsonify(success=False, message=_("No account found with that email.")), 404
+            return redirect(url_for("dashboard", message=_("No account with that email")))
+        otp = str(random.randint(100000, 999999))
+        conn.execute(
+            "DELETE FROM otp_tokens WHERE email = ? AND purpose = 'forgot_password' AND used = 0",
+            (email,),
+        )
+        conn.execute(
+            "INSERT INTO otp_tokens (email, otp, purpose) VALUES (?, ?, ?)",
+            (email, otp, "forgot_password"),
+        )
+        conn.commit()
+    ok, message = send_otp_email(email, otp, "forgot_password")
+    if request.is_json:
+        return jsonify(success=ok, message=message)
+    return redirect(url_for("dashboard", message=message if ok else message))
+
+
+@app.route("/verify_otp", methods=["POST"])
+def verify_otp():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    otp = (data.get("otp") or "").strip()
+    if not email or not otp:
+        return jsonify(success=False, message=_("Email and OTP are required.")), 400
+    with get_db_connection() as conn:
+        row = conn.execute(
+            """SELECT id FROM otp_tokens
+               WHERE email = ? AND otp = ? AND purpose = 'forgot_password'
+               AND used = 0
+               AND created_at >= datetime('now', '-15 minutes')""",
+            (email, otp),
+        ).fetchone()
+    if not row:
+        return jsonify(success=False, message=_("Invalid or expired OTP. Please request a new one.")), 400
+    session["otp_verified_email"] = email
+    return jsonify(success=True, message=_("OTP verified. Please set your new password."))
+
+
+@app.route("/reset_password", methods=["POST"])
+def reset_password():
+    data = request.get_json(silent=True) or {}
+    new_password = data.get("new_password") or ""
+    confirm_password = data.get("confirm_password") or ""
+    verified_email = session.get("otp_verified_email")
+    if not verified_email:
+        return jsonify(success=False, message=_("Session expired. Please restart the forgot password process.")), 400
+    if len(new_password) < 8:
+        return jsonify(success=False, message=_("Password must be at least 8 characters.")), 400
+    if new_password != confirm_password:
+        return jsonify(success=False, message=_("Passwords do not match.")), 400
+    with get_db_connection() as conn:
+        result = conn.execute(
+            "UPDATE users SET password = ? WHERE email = ?",
+            (generate_password_hash(new_password), verified_email),
+        )
+        conn.execute(
+            "UPDATE otp_tokens SET used = 1 WHERE email = ? AND purpose = 'forgot_password' AND used = 0",
+            (verified_email,),
+        )
+        conn.commit()
+        if result.rowcount == 0:
+            return jsonify(success=False, message=_("Account not found.")), 404
+    session.pop("otp_verified_email", None)
+    return jsonify(success=True, message=_("Password reset successfully. You can now log in with your new password."))
+
+
+@app.route("/delete_account", methods=["POST"])
+def delete_account():
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+    password = request.form.get("delete_password", "")
+    with get_db_connection() as conn:
+        user = conn.execute("SELECT password FROM users WHERE id = ?", (session["user_id"],)).fetchone()
+        if not user or not is_password_valid(user["password"], password):
+            return redirect(url_for("dashboard", message=_("Incorrect password")))
+        conn.execute("DELETE FROM users WHERE id = ?", (session["user_id"],))
+        conn.commit()
+    session.clear()
+    return redirect(url_for("login", message=_("Account deleted successfully")))
+
+
+@app.after_request
+def set_security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
+
+
+@app.errorhandler(404)
+def not_found(_error):
+    return render_template("404.html"), 404
+
+
+@app.errorhandler(500)
+def server_error(_error):
+    return render_template("500.html"), 500
+
+
+init_db()
+
+
+if __name__ == "__main__":
+    app.run(debug=False)

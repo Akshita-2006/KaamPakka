@@ -1,0 +1,609 @@
+<!doctype html>
+<html lang="{{ lang }}">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="csrf-token" content="{{ csrf_token() }}" />
+    <title>{{ _("Nivara - %(page)s", page=_("Care Commerce")) }}</title>
+    <link
+      href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/static/styles/dashboard.css" />
+  </head>
+  <body>
+    <div class="dashboard">
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+          <div
+            class="sidebar-logo"
+            style="
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              gap: 8px;
+            "
+          >
+            <img src="/static/images/nivara-mark.svg" alt="Nivara" width="38" height="38" />
+            {{ _("Nivara") }}
+          </div>
+          <div class="sidebar-subtitle">{{ _("AI-guided care commerce") }}</div>
+        </div>
+        <nav>
+          <ul class="sidebar-nav">
+            <li class="nav-item">
+              <a class="nav-link active" data-section="dashboard"
+                ><span class="nav-icon">&#128202;</span
+                ><span class="nav-text">{{ _("Dashboard") }}</span></a
+              >
+            </li>
+            <li class="nav-item">
+              <a class="nav-link" data-section="scanner"
+                ><span class="nav-icon">&#128247;</span
+                ><span class="nav-text">{{ _("Build a care plan") }}</span></a
+              >
+            </li>
+            <li class="nav-item">
+              <a class="nav-link" data-section="hospitals"
+                ><span class="nav-icon">&#127973;</span
+                ><span class="nav-text">{{ _("Care access map") }}</span></a
+              >
+            </li>
+            <li class="nav-item">
+              <a class="nav-link" data-section="history"
+                ><span class="nav-icon">&#128203;</span
+                ><span class="nav-text">{{ _("Scan History") }}</span></a
+              >
+            </li>
+            <li class="nav-item">
+              <a class="nav-link" href="{{ url_for('merchant_workspace') }}"
+                ><span class="nav-icon">&#9638;</span
+                ><span class="nav-text">{{ _("Merchant workspace") }}</span></a
+              >
+            </li>
+            <li class="nav-item">
+              <a class="nav-link" data-section="profile"
+                ><span class="nav-icon">&#128100;</span
+                ><span class="nav-text">{{ _("Profile") }}</span></a
+              >
+            </li>
+          </ul>
+        </nav>
+      </aside>
+
+      <div class="sidebar-overlay" id="sidebarOverlay"></div>
+
+      <main class="main-content" id="mainContent">
+        <header class="header">
+          <div class="header-left">
+            <button class="menu-toggle" id="menuToggle" type="button">
+              {{ _("Menu") }}
+            </button>
+            <h1 class="page-title" id="pageTitle">{{ _("Dashboard") }}</h1>
+          </div>
+          <div class="header-right">
+            <form action="/set_language" method="POST">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+              <select
+                name="language"
+                onchange="this.form.submit()"
+                class="form-input"
+                aria-label="Language"
+              >
+                <option value="en" {% if lang == "en" %}selected{% endif %}>English</option>
+                <option value="hi" {% if lang == "hi" %}selected{% endif %}>हिन्दी</option>
+              </select>
+            </form>
+            <div class="user-profile" onclick="showSection('profile')">
+              <div class="user-avatar">{{ user.first_name[0]|upper }}</div>
+              <div class="user-info">
+                <div class="user-name">
+                  {{ user.first_name }} {{ user.last_name }}
+                </div>
+              </div>
+            </div>
+          </div>
+        </header>
+
+        <section class="content-section active" id="dashboard">
+          <div class="care-commerce-hero">
+            <div><span>NIVARA AGENT</span><h2>{% if lang == 'hi' %}भुगतान से पहले अपना प्लान जानें।{% else %}Know the plan before money moves.{% endif %}</h2><p>{% if lang == 'hi' %}बिल का विश्लेषण करें, किफायती विकल्प देखें और फिर अपने नियंत्रण में PayPal चेकआउट अनुमोदित करें।{% else %}Analyze a bill, review lower-cost options, then approve a user-controlled PayPal checkout.{% endif %}</p></div>
+            <div class="agent-flow"><b>{% if lang == 'hi' %}01 विश्लेषण{% else %}01 Analyze{% endif %}</b><b>{% if lang == 'hi' %}02 समीक्षा{% else %}02 Review{% endif %}</b><b>{% if lang == 'hi' %}03 अनुमति{% else %}03 Approve{% endif %}</b><b>{% if lang == 'hi' %}04 भुगतान{% else %}04 Pay{% endif %}</b></div>
+          </div>
+          <div class="dashboard-grid">
+            <div class="dashboard-card" onclick="showSection('scanner')">
+              <div class="card-header">
+                <div class="card-icon">🗒️</div>
+                <div class="card-title">{{ _("Total Scans") }}</div>
+              </div>
+              <div class="card-description">
+                {{ _("Upload a bill to start an AI-reviewed affordability plan.") }}
+              </div>
+              <div class="card-stats">
+                <span class="stat-label">{{ _("Plans started") }}</span
+                ><span class="stat-value">{{ metrics.total_scans }}</span>
+              </div>
+            </div>
+            {% if scans %}
+            <a href="{{ url_for('care_plan', scan_id=scans[0].id) }}" class="dashboard-card care-plan-card" style="text-decoration: none">
+              <div class="card-header"><div class="card-icon">↗</div><div class="card-title">{{ _("Latest care plan") }}</div></div>
+              <div class="card-description">{{ _("Review your latest AI affordability basket and continue to PayPal Sandbox checkout.") }}</div>
+              <div class="card-stats"><span class="stat-label">{{ _("Payment events") }}</span><span class="stat-value">{{ metrics.care_plans }}</span></div>
+            </a>
+            {% endif %}
+            <a
+              href="{{ url_for('chatbot_page') }}"
+              class="dashboard-card"
+              style="text-decoration: none"
+            >
+              <div class="card-header">
+                <div class="card-icon">🤖</div>
+                <div class="card-title">{{ _("AI Assistant") }}</div>
+              </div>
+              <div class="card-description">
+                {{ _("Ask about your care plan, medicine pricing, or what to check before checkout.") }}
+              </div>
+              <div class="card-stats">
+                <span class="stat-label">{{ _("Chat Messages") }}</span
+                ><span class="stat-value">{{ metrics.chat_count }}</span>
+              </div>
+            </a>
+            <div class="dashboard-card" onclick="showSection('hospitals')">
+              <div class="card-header">
+                <div class="card-icon">📍</div>
+                <div class="card-title">{{ _("Care access map") }}</div>
+              </div>
+              <div class="card-description">
+                {{ _("Find nearby care access points while you verify a merchant or medicine option.") }}
+              </div>
+              <div class="card-stats">
+                <span class="stat-label">{{ _("Location based") }}</span
+                ><span class="stat-value">{{ _("Live") }}</span>
+              </div>
+            </div>
+            <div class="dashboard-card" onclick="showSection('history')">
+              <div class="card-header">
+                <div class="card-icon">💰</div>
+                <div class="card-title">{{ _("Estimated Savings") }}</div>
+              </div>
+              <div class="card-description">
+                {{ _("Estimated savings from detected overpricing across scan history.") }}
+              </div>
+              <div class="card-stats">
+                <span class="stat-label">{{ _("Reference comparison") }}</span
+                ><span class="stat-value">{{ _("Rs %(amount)s", amount=metrics.savings) }}</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="content-section" id="scanner">
+          <div class="scanner-container">
+            <h2
+              style="
+                text-align: center;
+                margin-bottom: 2rem;
+                color: var(--text);
+              "
+            >
+              {{ _("Medical Bill Scanner") }}
+            </h2>
+            <form
+              id="scannerForm"
+              action="/scan"
+              method="POST"
+              enctype="multipart/form-data"
+            >
+              <label for="fileInput" id="dropArea" class="upload-area">
+                <div id="uploadIcon" class="upload-icon">FILE</div>
+                <div class="upload-text">{{ _("Drop your medical bill here") }}</div>
+                <div class="upload-subtext">
+                  {{ _("or click to browse JPG or PNG files") }}
+                </div>
+                <input
+                  type="file"
+                  id="fileInput"
+                  name="file"
+                  style="display: none"
+                  accept="image/*,.pdf"
+                />
+              </label>
+              <div
+                id="filePreview"
+                style="display: none; margin-top: 1rem; text-align: center"
+              >
+                <p style="color: var(--text-light)">{{ _("Selected File:") }}</p>
+                <p id="fileName" style="font-weight: 600"></p>
+              </div>
+              <div style="text-align: center; margin-top: 2rem">
+                <button
+                  type="submit"
+                  id="scanBtn"
+                  style="
+                    padding: 1rem 2rem;
+                    background: var(--info);
+                    color: var(--white);
+                    border: none;
+                    border-radius: 8px;
+                    font-size: 1rem;
+                    cursor: pointer;
+                  "
+                >
+                  {{ _("Start Scan") }}
+                </button>
+              </div>
+              <div
+                id="loadingSpinner"
+                style="display: none; text-align: center; margin-top: 2rem"
+              >
+                <div class="scan-spinner" aria-hidden="true"></div>
+                <p>{{ _("Scanning in progress...") }}</p>
+              </div>
+            </form>
+          </div>
+        </section>
+
+        <section class="content-section" id="hospitals">
+          <div
+            class="hospital-container"
+            style="
+              background: var(--white);
+              border-radius: 12px;
+              padding: 2rem;
+              box-shadow: var(--shadow);
+            "
+          >
+            <h2>{{ _("Care access map") }}</h2>
+            <p id="locationStatus">
+              {{ _("Use your browser location to find nearby care access points.") }}
+            </p>
+            <label
+              style="
+                display: flex;
+                gap: 0.5rem;
+                align-items: center;
+                margin: 1rem 0;
+              "
+            >
+              <input type="checkbox" id="ayushmanOnly" />
+              {{ _("Prioritize public-care listings") }}
+            </label>
+            <button class="send-button" type="button" id="findHospitalsBtn">
+              {{ _("Search care access") }}
+            </button>
+            <div
+              id="hospitalList"
+              style="display: grid; gap: 1rem; margin-top: 1.5rem"
+            ></div>
+          </div>
+        </section>
+
+        <section class="content-section" id="history">
+          <div
+            style="
+              background: var(--white);
+              border-radius: 12px;
+              padding: 2rem;
+              box-shadow: var(--shadow);
+            "
+          >
+            <h2 style="margin-bottom: 2rem; color: var(--text)">
+              {{ _("Scan History") }}
+            </h2>
+            {% if scans and scans|length > 0 %}
+            <ul style="list-style: none; padding: 0">
+              {% for scan in scans %}
+              <li
+                style="
+                  background: #f1f1f1;
+                  margin-bottom: 1rem;
+                  padding: 1rem;
+                  border-radius: 10px;
+                "
+              >
+                <strong>{{ scan.filename }}</strong><br />
+                <em>{{ scan.timestamp }}</em><br />
+                {% if scan.flagged and scan.flagged != '{}' %}
+                <span style="color: #b91c1c; font-weight: bold"
+                  >{{ _("Overbilling detected") }}</span
+                >
+                {% else %}
+                <span style="color: #047857">{{ _("No overbilling detected") }}</span>
+                {% endif %}
+                <div style="margin-top: 0.5rem">
+                  <a
+                    href="/result/{{ scan.id }}"
+                    style="font-weight: bold; color: #2d7ae0"
+                    >{{ _("View detailed bill analysis") }}</a
+                  >
+                </div>
+              </li>
+              {% endfor %}
+            </ul>
+            {% else %}
+            <p class="empty-state">
+              {{ _("Your scan history will appear here once you start scanning documents.") }}
+            </p>
+            {% endif %}
+          </div>
+        </section>
+
+        <section class="content-section" id="profile">
+          <div class="profile-container">
+            <h2 class="profile-heading">{{ _("Manage Your Account") }}</h2>
+            <div class="profile-header">
+              <div class="profile-avatar">{{ user.first_name[0]|upper }}</div>
+              <div class="profile-info-container">
+                <div class="profile-info">
+                  <h2>{{ user.first_name }} {{ user.last_name }}</h2>
+                  <p>{{ user.email }}</p>
+                  <p>{{ _("Status: %(status)s", status=_("Active")) }}</p>
+                </div>
+                <button
+                  type="button"
+                  class="btn-profile-update"
+                  onclick="enableEditing()"
+                >
+                  {{ _("Edit Profile") }}
+                </button>
+              </div>
+            </div>
+            <form
+              class="profile-form"
+              id="updateProfileForm"
+              action="/update_profile"
+              method="POST"
+            >
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+              <div class="form-group">
+                <label class="form-label">{{ _("First Name") }}</label
+                ><input
+                  type="text"
+                  name="first_name"
+                  class="form-input"
+                  value="{{ user.first_name }}"
+                  readonly
+                />
+              </div>
+              <div class="form-group">
+                <label class="form-label">{{ _("Last Name") }}</label
+                ><input
+                  type="text"
+                  name="last_name"
+                  class="form-input"
+                  value="{{ user.last_name }}"
+                  readonly
+                />
+              </div>
+              <div class="form-group">
+                <label class="form-label">{{ _("Username") }}</label
+                ><input
+                  type="text"
+                  name="username"
+                  class="form-input"
+                  value="{{ user.username }}"
+                  readonly
+                />
+              </div>
+              <div class="form-group">
+                <label class="form-label">{{ _("Email") }}</label
+                ><input
+                  type="email"
+                  name="email"
+                  class="form-input"
+                  value="{{ user.email }}"
+                  readonly
+                />
+              </div>
+              <div class="form-group">
+                <label class="form-label">{{ _("State") }}</label>
+                <select name="state" class="form-input" disabled>
+                  <option value="">{{ _("-- Select State --") }}</option>
+                  {% set states = [('maharashtra',_('Maharashtra')),('tamil_nadu',_('Tamil Nadu')),('karnataka',_('Karnataka')),('west_bengal',_('West Bengal')),('telangana',_('Telangana')),('andhra_pradesh',_('Andhra Pradesh')),('rajasthan',_('Rajasthan')),('gujarat',_('Gujarat')),('delhi',_('Delhi')),('kerala',_('Kerala'))] %}
+                  {% for val, label in states %}
+                  <option value="{{ val }}" {% if user['state'] == val %}selected{% endif %}>{{ label }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">{{ _("Category") }}</label>
+                <select name="caste_category" class="form-input" disabled>
+                  <option value="general" {% if (user['caste_category'] or 'general') == 'general' %}selected{% endif %}>{{ _("General") }}</option>
+                  <option value="sc" {% if user['caste_category'] == 'sc' %}selected{% endif %}>{{ _("SC (Scheduled Caste)") }}</option>
+                  <option value="st" {% if user['caste_category'] == 'st' %}selected{% endif %}>{{ _("ST (Scheduled Tribe)") }}</option>
+                  <option value="ews" {% if user['caste_category'] == 'ews' %}selected{% endif %}>{{ _("EWS (Economically Weaker Section)") }}</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">{{ _("Annual Family Income") }}</label>
+                <select name="annual_income" class="form-input" disabled>
+                  <option value="not_specified" {% if (user['annual_income'] or 'not_specified') == 'not_specified' %}selected{% endif %}>{{ _("Prefer not to say") }}</option>
+                  <option value="below_1lakh" {% if user['annual_income'] == 'below_1lakh' %}selected{% endif %}>{{ _("Below ₹1,00,000") }}</option>
+                  <option value="1_2lakh" {% if user['annual_income'] == '1_2lakh' %}selected{% endif %}>{{ _("₹1,00,000 – ₹2,00,000") }}</option>
+                  <option value="2_5lakh" {% if user['annual_income'] == '2_5lakh' %}selected{% endif %}>{{ _("₹2,00,000 – ₹5,00,000") }}</option>
+                  <option value="above_5lakh" {% if user['annual_income'] == 'above_5lakh' %}selected{% endif %}>{{ _("Above ₹5,00,000") }}</option>
+                </select>
+              </div>
+              <div class="form-actions">
+                <button type="submit" class="btn-profile-save hidden">
+                  {{ _("Save Changes") }}
+                </button>
+              </div>
+            </form>
+            <div class="profile-actions-vertical">
+              <button
+                class="btn-secondary"
+                onclick="openModal('changePasswordModal')"
+              >
+                {{ _("Change Password") }}
+              </button>
+              <button
+                class="btn-secondary"
+                onclick="fpOpenModal()"
+              >
+                {{ _("Forgot Password") }}
+              </button>
+              <button
+                class="btn-secondary danger"
+                onclick="openModal('deleteAccountModal')"
+              >
+                {{ _("Delete Account") }}
+              </button>
+              <a
+                class="btn-secondary logout"
+                style="text-align: center; text-decoration: none"
+                href="/logout"
+                >{{ _("Logout") }}</a
+              >
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div id="changePasswordModal" class="modal">
+      <div class="modal-content">
+        <button type="button" class="close" onclick="closeModal('changePasswordModal')" aria-label="{{ _('Close') }}"
+          >&times;</button
+        >
+        <h3>{{ _("Change Password") }}</h3>
+        <form action="/change_password" method="POST">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+          <input
+            type="password"
+            name="current_password"
+            placeholder="{{ _('Current Password') }}"
+            class="form-input"
+            required
+          /><input
+            type="password"
+            name="confirm_current_password"
+            placeholder="{{ _('Confirm Current Password') }}"
+            class="form-input"
+            required
+          /><input
+            type="password"
+            name="new_password"
+            placeholder="{{ _('New Password') }}"
+            class="form-input"
+            required
+          /><input
+            type="password"
+            name="confirm_new_password"
+            placeholder="{{ _('Confirm New Password') }}"
+            class="form-input"
+            required
+          /><button type="submit" class="btn-modal">{{ _("Change") }}</button>
+        </form>
+      </div>
+    </div>
+    <div id="forgotPasswordModal" class="modal">
+      <div class="modal-content">
+        <button type="button" class="close" onclick="fpCloseModal()" aria-label="{{ _('Close') }}">&times;</button>
+        <h3>{{ _("Forgot Password") }}</h3>
+
+        <!-- Step 1: email -->
+        <div id="fpStep1">
+          <p style="font-size:.9rem;color:#555;margin-bottom:1rem;">
+            {{ _("Enter your registered email — we'll send a 6-digit OTP.") }}
+          </p>
+          <input type="email" id="fpEmail" placeholder="{{ _('Registered email address') }}" class="form-input" />
+          <button type="button" class="btn-modal" onclick="fpSendOtp()">{{ _("Send OTP") }}</button>
+          <p id="fpMsg1" style="margin-top:.6rem;font-size:.85rem;"></p>
+        </div>
+
+        <!-- Step 2: OTP -->
+        <div id="fpStep2" style="display:none;">
+          <p style="font-size:.9rem;color:#555;margin-bottom:1rem;">
+            {{ _("Enter the 6-digit OTP sent to your email. Valid for 15 minutes.") }}
+          </p>
+          <input type="text" id="fpOtp" placeholder="{{ _('6-digit OTP') }}" class="form-input"
+                 maxlength="6" inputmode="numeric" />
+          <button type="button" class="btn-modal" onclick="fpVerifyOtp()">{{ _("Verify OTP") }}</button>
+          <p id="fpMsg2" style="margin-top:.6rem;font-size:.85rem;"></p>
+        </div>
+
+        <!-- Step 3: new password -->
+        <div id="fpStep3" style="display:none;">
+          <p style="font-size:.9rem;color:#047857;margin-bottom:1rem;">
+            {{ _("OTP verified. Set your new password.") }}
+          </p>
+          <input type="password" id="fpNewPass" placeholder="{{ _('New password (min 8 chars)') }}" class="form-input" />
+          <input type="password" id="fpConfPass" placeholder="{{ _('Confirm new password') }}" class="form-input" />
+          <button type="button" class="btn-modal" onclick="fpResetPassword()">{{ _("Reset Password") }}</button>
+          <p id="fpMsg3" style="margin-top:.6rem;font-size:.85rem;"></p>
+        </div>
+      </div>
+    </div>
+    <div id="deleteAccountModal" class="modal">
+      <div class="modal-content">
+        <button type="button" class="close" onclick="closeModal('deleteAccountModal')" aria-label="{{ _('Close') }}"
+          >&times;</button
+        >
+        <h3>{{ _("Delete Account") }}</h3>
+        <p>
+          {{ _("This action is irreversible. Confirm your password to delete your account.") }}
+        </p>
+        <form action="/delete_account" method="POST">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+          <input
+            type="password"
+            name="delete_password"
+            placeholder="{{ _('Confirm Password') }}"
+            class="form-input"
+            required
+          /><button type="submit" class="btn-modal danger">{{ _("Delete") }}</button>
+        </form>
+      </div>
+    </div>
+    <div id="feedbackModal" class="modal">
+      <div class="modal-content">
+        <button type="button" class="close" onclick="closeModal('feedbackModal')" aria-label="{{ _('Close') }}">&times;</button>
+        <h3 id="feedbackTitle">{{ _("Action") }}</h3>
+        <p id="feedbackMessage"></p>
+        <button class="btn-modal" onclick="closeModal('feedbackModal')">
+          {{ _("OK") }}
+        </button>
+      </div>
+    </div>
+
+    <script>
+      window.I18N = {
+        pleaseSelectFile: "{{ _('Please select a file first.') }}",
+        scanTitle: "{{ _('Scan') }}",
+        scanFailedTitle: "{{ _('Scan failed') }}",
+        unknownError: "{{ _('Unknown error') }}",
+        noHospitalsFound: "{{ _('No hospitals found for the selected filter.') }}",
+        distanceLabel: "{{ _('Distance: %%(km)s km') }}",
+        contactLabel: "{{ _('Contact: %%(contact)s') }}",
+        ayushmanPossible: "Public-care tag found in map data; verify directly with the provider.",
+        ayushmanUnknown: "Care-access status is not confirmed in map data.",
+        openMap: "{{ _('Open map') }}",
+        geolocationUnsupported: "{{ _('Browser geolocation is not supported.') }}",
+        gettingLocation: "{{ _('Getting location...') }}",
+        locationLabel: "{{ _('Location: %%(lat)s, %%(lon)s') }}",
+        hospitalSearchFailed: "{{ _('Hospital search failed.') }}",
+        hospitalSearchUnavailable: "{{ _('Hospital search is temporarily unavailable.') }}",
+        locationDenied: "{{ _('Location access denied. Enable location permission to search nearby hospitals.') }}",
+        appName: "{{ _('Nivara') }}",
+        enterEmail: "{{ _('Please enter your email.') }}",
+        sendingOtp: "{{ _('Sending OTP…') }}",
+        networkError: "{{ _('Network error. Please try again.') }}",
+        enterOtp: "{{ _('Please enter the OTP.') }}",
+        verifying: "{{ _('Verifying…') }}",
+        passwordMin8: "{{ _('Password must be at least 8 characters.') }}",
+        passwordsDontMatch: "{{ _('Passwords do not match.') }}",
+        resetting: "{{ _('Resetting…') }}",
+        passwordResetTitle: "{{ _('Password Reset') }}"
+      };
+      window.FP_CONFIG = {
+        openModal: () => openModal('forgotPasswordModal'),
+        closeModal: () => closeModal('forgotPasswordModal'),
+        onResetSuccess: (message) => showFeedback(I18N.passwordResetTitle, message),
+      };
+    </script>
+    <script src="/static/scripts/forgot-password.js"></script>
+    <script src="/static/scripts/dashboard.js"></script>
+  </body>
+</html>

@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="{{ lang }}">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Nivara | Merchant workspace</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&family=Playfair+Display:ital,wght@0,500;1,500&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community/styles/ag-grid.css" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community/styles/ag-theme-quartz.css" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles/merchant_workspace.css') }}" />
+  </head>
+  <body>
+    <main class="shell">
+      <nav><a class="brand" href="{{ url_for('dashboard') }}"><img src="{{ url_for('static', filename='images/nivara-mark.svg') }}" alt="" /> NIVARA</a><span>MERCHANT WORKSPACE · DEMO</span></nav>
+      <section class="hero"><div><p class="eyebrow">AGENTIC COMMERCE CONTROL LAYER</p><h1>Turn care intent into<br /><em>fulfillable demand.</em></h1><p>Nivara gives merchants a transparent view of approved care-plan demand. This demo uses simulated marketplace offers and your sandbox payment events only.</p></div><a class="back" href="{{ url_for('dashboard') }}">← Return to care workspace</a></section>
+      <section class="metrics"><article><span>MERCHANTS</span><strong>3</strong><p>transparent offers</p></article><article><span>PAYMENT EVENTS</span><strong id="event-count">0</strong><p>from this account</p></article><article><span>PAYPAL MODE</span><strong>Sandbox</strong><p>safe demo checkout</p></article></section>
+      <section class="workspace"><div class="section-head"><div><p class="eyebrow">MARKETPLACE PERFORMANCE</p><h2>Offer operations</h2></div><p>Sort, filter, and inspect the merchant offer data. AG Grid makes the marketplace logic reviewable rather than hidden.</p></div><div id="merchantGrid" class="ag-theme-quartz" aria-label="Merchant marketplace operations table"></div></section>
+      <section class="principles"><article><b>01</b><h3>User control</h3><p>An agent can prepare an option; only a user can approve and begin payment.</p></article><article><b>02</b><h3>Transparent ranking</h3><p>Price, speed, and positioning are visible before checkout—no black-box recommendation.</p></article><article><b>03</b><h3>Sandbox-safe</h3><p>Demo merchants are illustrative; payments go to the configured PayPal Sandbox business account.</p></article></section>
+    </main>
+    <script src="https://cdn.jsdelivr.net/npm/ag-grid-community/dist/ag-grid-community.min.js"></script>
+    <script>
+      const rowData = {{ merchant_rows|tojson }};
+      document.getElementById('event-count').textContent = rowData.reduce((total, row) => total + row.orders, 0);
+      const money = value => `₹${Number(value || 0).toFixed(2)}`;
+      const gridOptions = {
+        rowData,
+        columnDefs: [
+          { field: 'merchant', headerName: 'Merchant', minWidth: 190, filter: true },
+          { field: 'positioning', headerName: 'Offer promise', minWidth: 160 },
+          { field: 'deliveryWindow', headerName: 'Delivery window', minWidth: 155 },
+          { field: 'orders', headerName: 'Orders', type: 'numericColumn', minWidth: 110 },
+          { field: 'captured', headerName: 'Captured', type: 'numericColumn', minWidth: 120 },
+          { field: 'grossValue', headerName: 'Sandbox GMV', valueFormatter: params => money(params.value), type: 'numericColumn', minWidth: 150 },
+          { field: 'readiness', headerName: 'Status', minWidth: 155, cellClass: 'status-cell' }
+        ],
+        defaultColDef: { sortable: true, resizable: true, flex: 1 },
+        animateRows: true,
+        pagination: true,
+        paginationPageSize: 10,
+        theme: 'legacy'
+      };
+      agGrid.createGrid(document.querySelector('#merchantGrid'), gridOptions);
+    </script>
+  </body>
+</html>

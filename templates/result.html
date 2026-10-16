@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="{{ lang }}">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>{{ _("Care evidence - Nivara") }}</title>
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/static/styles/result.css" />
+  </head>
+  <body>
+    <h2>{{ _("Scan Results") }}</h2>
+
+    <!-- Export buttons -->
+    <div class="export-bar">
+      <a href="/result/{{ scan_id }}/export/csv" class="btn-export">&#11015; {{ _("Download CSV") }}</a>
+      <a href="/result/{{ scan_id }}/export/pdf" class="btn-export">&#11015; {{ _("Download PDF") }}</a>
+      <a href="/dashboard" class="btn-export" style="background:#6b7280;">&#8592; {{ _("Dashboard") }}</a>
+    </div>
+
+    <p class="results-intro">
+      {{ _("Quantities show how many units were read from your bill and how they were interpreted for comparison. Pack sizes are taken from the bill when available, then normalized against Jan Aushadhi reference pricing.") }}
+    </p>
+
+    {% if report.get('summary', {}).get('low_confidence_disclaimer') %}
+    <p class="confidence-warning">{{ report.summary.low_confidence_disclaimer }}</p>
+    {% endif %}
+
+    <!-- Reference-price savings banner -->
+    {% set total_ja_savings = namespace(val=0) %}
+    {% for item in report.get('detected_items', []) %}
+      {% if item.get('jan_aushadhi_savings') and item.jan_aushadhi_savings > 0 %}
+        {% set total_ja_savings.val = total_ja_savings.val + item.jan_aushadhi_savings %}
+      {% endif %}
+    {% endfor %}
+    {% if total_ja_savings.val > 0 %}
+    <div class="ja-banner">
+      <span class="ja-icon">&#127968;</span>
+      <div>
+        <strong>Reference-price savings identified</strong>
+        <p>
+          {% trans amount=total_ja_savings.val | round(2) %}
+          Reviewing comparable lower-cost options could save you approximately
+          <strong>Rs {{ amount }}</strong> on this bill.
+          {% endtrans %}
+          Review the options in your care plan before making any purchase.
+        </p>
+      </div>
+    </div>
+    {% endif %}
+
+    <section class="care-plan-cta">
+      <div>
+        <span class="cta-kicker">NIVARA AGENT · NEXT STEP</span>
+        <h3>Turn these savings into a reviewed care plan.</h3>
+        <p>Compare the high-confidence alternatives, approve the basket yourself, then complete a PayPal Sandbox checkout.</p>
+      </div>
+      <a href="{{ url_for('care_plan', scan_id=scan_id) }}">Build care plan →</a>
+    </section>
+
+    <div class="table-scroll">
+    <table id="resultsTable">
+      <thead>
+        <tr>
+          <th>{{ _("Medicine") }}</th>
+          <th>{{ _("Category") }}</th>
+          <th>{{ _("Quantity on Bill") }}</th>
+          <th>{{ _("Pack Size") }}</th>
+          <th>{{ _("What You Paid") }}</th>
+          <th>Reference price</th>
+          <th>{{ _("Overpaid By") }}</th>
+          <th>{{ _("Confidence") }}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% set items = report.get('detected_items', []) %}
+        {% if items %}
+          {% for item in items %}
+          {% set is_low = item.get('confidence_tier') == 'low' %}
+          {% set is_over = item.difference and item.difference > 0 and not is_low %}
+          <tr class="{% if is_over %}overbilled{% elif is_low %}low-confidence{% endif %}">
+            <td class="cell-left">{{ item.name }}</td>
+            <td>{{ item.category }}</td>
+            <td class="cell-qty">
+              <strong>{{ item.get('quantity_display', item.get('quantity', 1)) }}</strong>
+              <span class="cell-sub">{{ item.get('quantity_detail', '') }}</span>
+              <span class="cell-sub">{{ item.get('comparison_label', '') }}</span>
+            </td>
+            <td>
+              {{ item.get('pack_size_display', item.get('unit', 'N/A')) }}
+              {% if item.get('price_normalized') %}
+              <span class="cell-sub">Normalized against a reference pack size</span>
+              {% endif %}
+            </td>
+            <td class="cell-left">{{ item.get('billed_display', _('Not detected')) }}</td>
+            <td class="cell-left">{{ item.get('expected_display', _('N/A')) }}</td>
+            <td>
+              {% if is_low %}
+                <span class="cell-sub">{{ _("Estimated only") }}</span>
+              {% elif item.difference is not none %}
+                {{ _("Rs %(amount)s", amount=item.difference) }}
+                {% if item.overpricing_percentage %}<span class="cell-sub">{{ _("%(pct)s%% above reference", pct=item.overpricing_percentage) }}</span>{% endif %}
+                {% if item.get('pricing_status') %}<span class="cell-sub">{{ item.pricing_status }}</span>{% endif %}
+                {% if item.get('jan_aushadhi_note') %}
+                <span class="cell-sub ja-note">{{ item.jan_aushadhi_note }}</span>
+                {% endif %}
+              {% else %}
+                {{ item.get('pricing_status', _("N/A")) }}
+              {% endif %}
+            </td>
+            <td>
+              {% if item.get('confidence_tier') %}
+                {{ translate_confidence(item.confidence_tier) }}
+                {% if item.get('combined_confidence') is not none %}
+                <span class="cell-sub">{{ (item.combined_confidence * 100)|round(0)|int }}%</span>
+                {% endif %}
+              {% else %}
+                {{ _("N/A") }}
+              {% endif %}
+              {% if item.get('low_confidence_disclaimer') %}
+              <span class="cell-sub">{{ item.low_confidence_disclaimer }}</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        {% else %}
+          <tr><td colspan="8" class="no-data">{{ _("No matching medicines were detected in the bill text.") }}</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+    </div><!-- /.table-scroll -->
+
+    <div class="illness-section">
+      <h3>{{ _("Structured Report") }}</h3>
+      <p>{{ _("Parser used: %(source)s", source=report.get('parse_source', 'rule_based')|replace('_', ' ')) }}</p>
+      <p>{{ _("Total items detected: %(count)s", count=report.get('summary', {}).get('total_detected', 0)) }}</p>
+      <p>{{ _("High-confidence overpriced items: %(count)s", count=report.get('summary', {}).get('overpriced_count', 0)) }}</p>
+      <p>{{ _("Estimated savings: Rs %(amount)s", amount=report.get('summary', {}).get('estimated_savings', 0)) }}</p>
+      {% if report.get('low_confidence_items') %}
+      <p>{{ _("Low-confidence items: %(count)s", count=report.get('low_confidence_items')) }}</p>
+      {% endif %}
+      {% if report.get('duplicates') %}
+      <p>{{ _("Duplicate detections: %(names)s", names=report.get('duplicates')|join(', ')) }}</p>
+      {% endif %}
+      {% if report.get('invalid_pricing') %}
+      <p>{{ _("Invalid or missing prices: %(names)s", names=report.get('invalid_pricing')|join(', ')) }}</p>
+      {% endif %}
+      {% if report.get('missing_medicine_detection') %}
+      <p>{{ report.get('missing_medicine_detection') }}</p>
+      {% endif %}
+    </div>
+
+    {% if transcript %}
+    <div class="illness-section">
+      <h3>{{ _("OCR Transcript") }}</h3>
+      <pre style="white-space: pre-wrap; margin: 0; font-family: inherit;">{{ transcript }}</pre>
+    </div>
+    {% endif %}
+
+    {% if illness %}
+    <div class="illness-section">
+      <h3>{{ _("Detected Treatment Context") }}</h3>
+      <p>{{ illness }}</p>
+    </div>
+    {% endif %}
+
+
+    <!-- Phase 5: non-medicine bill entries -->
+    {% set other_items = report.get('non_medicine_items', []) %}
+    {% if other_items %}
+    <div class="illness-section">
+      <h3>{{ _("Other Bill Entries Detected") }}</h3>
+      <div class="table-scroll">
+      <table id="otherTable">
+        <thead>
+          <tr>
+            <th>{{ _("Description") }}</th>
+            <th>{{ _("Category") }}</th>
+            <th>{{ _("Quantity") }}</th>
+            <th>{{ _("Amount (Rs)") }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in other_items %}
+          <tr>
+            <td class="cell-left">{{ item.name }}</td>
+            <td>{{ translate_category(item.category_type) }}</td>
+            <td>{{ item.quantity }}</td>
+            <td>{{ item.line_total }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- Phase 5: category breakdown -->
+    {% set breakdown = report.get('category_breakdown', {}) %}
+    {% if breakdown %}
+    <div class="illness-section">
+      <h3>{{ _("Bill Category Breakdown") }}</h3>
+      <div class="category-grid">
+        {% for cat, count in breakdown.items() %}
+        <div class="category-chip">
+          <span class="chip-label">{{ translate_category(cat) }}</span>
+          <span class="chip-count">{{ count }}</span>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+
+    <div style="text-align:center;margin:2rem 0;">
+      <a href="/dashboard" class="btn-back">&#8592; {{ _("Back to Dashboard") }}</a>
+    </div>
+  </body>
+</html>
