@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="csrf-token" content="{{ csrf_token() }}" />
-    <title>{{ _("Nivara - %(page)s", page=_("Care Commerce")) }}</title>
+    <title>{{ _("KaamPakka - %(page)s", page=_("Repair Desk")) }}</title>
     <link
       href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap"
       rel="stylesheet"
@@ -25,10 +25,10 @@
               gap: 8px;
             "
           >
-            <img src="/static/images/nivara-mark.svg" alt="Nivara" width="38" height="38" />
-            {{ _("Nivara") }}
+            <img src="/static/images/kaampakka-mark.svg" alt="KaamPakka" width="38" height="38" />
+            {{ _("KaamPakka") }}
           </div>
-          <div class="sidebar-subtitle">{{ _("AI-guided care commerce") }}</div>
+          <div class="sidebar-subtitle">{{ _("AI-guided repair requests") }}</div>
         </div>
         <nav>
           <ul class="sidebar-nav">
@@ -41,19 +41,19 @@
             <li class="nav-item">
               <a class="nav-link" data-section="scanner"
                 ><span class="nav-icon">&#128247;</span
-                ><span class="nav-text">{{ _("Build a care plan") }}</span></a
+                ><span class="nav-text">{{ _("New repair request") }}</span></a
               >
             </li>
             <li class="nav-item">
               <a class="nav-link" data-section="hospitals"
                 ><span class="nav-icon">&#127973;</span
-                ><span class="nav-text">{{ _("Care access map") }}</span></a
+                ><span class="nav-text">{{ _("Find technicians") }}</span></a
               >
             </li>
             <li class="nav-item">
               <a class="nav-link" data-section="history"
                 ><span class="nav-icon">&#128203;</span
-                ><span class="nav-text">{{ _("Scan History") }}</span></a
+                ><span class="nav-text">{{ _("Repair history") }}</span></a
               >
             </li>
             <li class="nav-item">
@@ -108,28 +108,33 @@
 
         <section class="content-section active" id="dashboard">
           <div class="care-commerce-hero">
-            <div><span>NIVARA AGENT</span><h2>{% if lang == 'hi' %}भुगतान से पहले अपना प्लान जानें।{% else %}Know the plan before money moves.{% endif %}</h2><p>{% if lang == 'hi' %}बिल का विश्लेषण करें, किफायती विकल्प देखें और फिर अपने नियंत्रण में PayPal चेकआउट अनुमोदित करें।{% else %}Analyze a bill, review lower-cost options, then approve a user-controlled PayPal checkout.{% endif %}</p></div>
-            <div class="agent-flow"><b>{% if lang == 'hi' %}01 विश्लेषण{% else %}01 Analyze{% endif %}</b><b>{% if lang == 'hi' %}02 समीक्षा{% else %}02 Review{% endif %}</b><b>{% if lang == 'hi' %}03 अनुमति{% else %}03 Approve{% endif %}</b><b>{% if lang == 'hi' %}04 भुगतान{% else %}04 Pay{% endif %}</b></div>
+            <div><span>KAAMPAKKA REPAIR COPILOT</span><h2>{% if lang == 'hi' %}तकनीशियन आने से पहले शर्तें जानें।{% else %}Know the terms before the technician arrives.{% endif %}</h2><p>{% if lang == 'hi' %}समस्या साझा करें, तकनीशियन की शर्तें जांचें और फिर अपने नियंत्रण में PayPal बुकिंग डिपॉजिट स्वीकार करें।{% else %}Describe the issue, review technician terms, then approve a buyer-controlled PayPal booking deposit.{% endif %}</p></div>
+            <div class="agent-flow"><b>01 Report</b><b>02 Quote</b><b>03 Approve</b><b>04 Book</b></div>
           </div>
           <div class="dashboard-grid">
             <div class="dashboard-card" onclick="showSection('scanner')">
               <div class="card-header">
-                <div class="card-icon">🗒️</div>
-                <div class="card-title">{{ _("Total Scans") }}</div>
+                <div class="card-icon glyph-plan" aria-hidden="true"><i></i><i></i><i></i></div>
+                <div class="card-title">{{ _("Repair requests") }}</div>
               </div>
               <div class="card-description">
-                {{ _("Upload a bill to start an AI-reviewed affordability plan.") }}
+                {{ _("Describe a breakdown to build an AI-guided technician brief.") }}
               </div>
               <div class="card-stats">
-                <span class="stat-label">{{ _("Plans started") }}</span
+                <span class="stat-label">{{ _("Jobs created") }}</span
                 ><span class="stat-value">{{ metrics.total_scans }}</span>
               </div>
             </div>
             {% if scans %}
             <a href="{{ url_for('care_plan', scan_id=scans[0].id) }}" class="dashboard-card care-plan-card" style="text-decoration: none">
-              <div class="card-header"><div class="card-icon">↗</div><div class="card-title">{{ _("Latest care plan") }}</div></div>
-              <div class="card-description">{{ _("Review your latest AI affordability basket and continue to PayPal Sandbox checkout.") }}</div>
+              <div class="card-header"><div class="card-icon glyph-arrow" aria-hidden="true">↗</div><div class="card-title">{{ _("Latest repair plan") }}</div></div>
+              <div class="card-description">{{ _("Review technician terms and continue to PayPal Sandbox booking deposit.") }}</div>
               <div class="card-stats"><span class="stat-label">{{ _("Payment events") }}</span><span class="stat-value">{{ metrics.care_plans }}</span></div>
+            </a>
+            <a href="{{ url_for('demo_receipt', scan_id=scans[0].id) }}" class="dashboard-card" style="text-decoration: none">
+              <div class="card-header"><div class="card-icon glyph-arrow" aria-hidden="true">↗</div><div class="card-title">{{ _("Demo booking receipt") }}</div></div>
+              <div class="card-description">{{ _("Preview the complete buyer decision record without creating a PayPal payment.") }}</div>
+              <div class="card-stats"><span class="stat-label">{{ _("Sandbox optional") }}</span><span class="stat-value">{{ _("View") }}</span></div>
             </a>
             {% endif %}
             <a
@@ -138,11 +143,11 @@
               style="text-decoration: none"
             >
               <div class="card-header">
-                <div class="card-icon">🤖</div>
+                <div class="card-icon glyph-spark" aria-hidden="true">✦</div>
                 <div class="card-title">{{ _("AI Assistant") }}</div>
               </div>
               <div class="card-description">
-                {{ _("Ask about your care plan, medicine pricing, or what to check before checkout.") }}
+                {{ _("Ask about repair quotes, parts caps, warranties, or what to check before booking.") }}
               </div>
               <div class="card-stats">
                 <span class="stat-label">{{ _("Chat Messages") }}</span
@@ -151,11 +156,11 @@
             </a>
             <div class="dashboard-card" onclick="showSection('hospitals')">
               <div class="card-header">
-                <div class="card-icon">📍</div>
-                <div class="card-title">{{ _("Care access map") }}</div>
+                <div class="card-icon glyph-pin" aria-hidden="true"><i></i></div>
+                <div class="card-title">{{ _("Technician discovery") }}</div>
               </div>
               <div class="card-description">
-                {{ _("Find nearby care access points while you verify a merchant or medicine option.") }}
+                {{ _("Find nearby technicians while you compare arrival times and job terms.") }}
               </div>
               <div class="card-stats">
                 <span class="stat-label">{{ _("Location based") }}</span
@@ -164,11 +169,11 @@
             </div>
             <div class="dashboard-card" onclick="showSection('history')">
               <div class="card-header">
-                <div class="card-icon">💰</div>
-                <div class="card-title">{{ _("Estimated Savings") }}</div>
+                <div class="card-icon glyph-rupee" aria-hidden="true">₹</div>
+                <div class="card-title">{{ _("Terms reviewed") }}</div>
               </div>
               <div class="card-description">
-                {{ _("Estimated savings from detected overpricing across scan history.") }}
+                {{ _("Transparent job terms captured across your repair request history.") }}
               </div>
               <div class="card-stats">
                 <span class="stat-label">{{ _("Reference comparison") }}</span
@@ -179,34 +184,26 @@
         </section>
 
         <section class="content-section" id="scanner">
-          <div class="scanner-container">
-            <h2
-              style="
-                text-align: center;
-                margin-bottom: 2rem;
-                color: var(--text);
-              "
-            >
-              {{ _("Medical Bill Scanner") }}
-            </h2>
+          <div class="scanner-container repair-composer">
+            <div class="repair-composer-intro"><div><p class="repair-kicker">KAAMPAKKA AI JOB BRIEF</p><h2>{{ _("Turn a repair problem into a job technicians can quote.") }}</h2><p>Upload a repair quote, invoice, or written request. KaamPakka extracts the visible job lines so you can confirm them before you book anyone.</p><a class="demo-quote-link" href="{{ url_for('static', filename='demo/kaampakka-demo-repair-quote.txt') }}" download>↓ Download the demo repair quote</a></div><div class="ai-boundary"><b>AI does</b><span>Reads service lines</span><span>Structures the job brief</span><span>Highlights terms to review</span><b>AI never does</b><span>Choose a technician</span><span>Approve extra charges</span><span>Pay on your behalf</span></div></div>
             <form
               id="scannerForm"
               action="/scan"
               method="POST"
               enctype="multipart/form-data"
             >
-              <label for="fileInput" id="dropArea" class="upload-area">
+              <label for="fileInput" id="dropArea" class="upload-area repair-drop-area">
                 <div id="uploadIcon" class="upload-icon">FILE</div>
-                <div class="upload-text">{{ _("Drop your medical bill here") }}</div>
+                <div class="upload-text">{{ _("Drop a repair quote, appliance invoice, issue photo, or text request") }}</div>
                 <div class="upload-subtext">
-                  {{ _("or click to browse JPG or PNG files") }}
+                  {{ _("JPG, PNG, PDF, or TXT · no live booking happens here") }}
                 </div>
                 <input
                   type="file"
                   id="fileInput"
                   name="file"
                   style="display: none"
-                  accept="image/*,.pdf"
+                  accept="image/*,.pdf,.txt"
                 />
               </label>
               <div
@@ -216,21 +213,13 @@
                 <p style="color: var(--text-light)">{{ _("Selected File:") }}</p>
                 <p id="fileName" style="font-weight: 600"></p>
               </div>
-              <div style="text-align: center; margin-top: 2rem">
+              <div class="repair-submit-row">
+                <div><span class="repair-step">STEP 1 OF 3</span><small>Request → terms → booking deposit</small></div>
                 <button
                   type="submit"
                   id="scanBtn"
-                  style="
-                    padding: 1rem 2rem;
-                    background: var(--info);
-                    color: var(--white);
-                    border: none;
-                    border-radius: 8px;
-                    font-size: 1rem;
-                    cursor: pointer;
-                  "
                 >
-                  {{ _("Start Scan") }}
+                  {{ _("Build my job brief") }} →
                 </button>
               </div>
               <div
@@ -238,7 +227,7 @@
                 style="display: none; text-align: center; margin-top: 2rem"
               >
                 <div class="scan-spinner" aria-hidden="true"></div>
-                <p>{{ _("Scanning in progress...") }}</p>
+                <p>{{ _("Structuring your repair brief...") }}</p>
               </div>
             </form>
           </div>
@@ -254,9 +243,9 @@
               box-shadow: var(--shadow);
             "
           >
-            <h2>{{ _("Care access map") }}</h2>
+            <h2>{{ _("Technician discovery") }}</h2>
             <p id="locationStatus">
-              {{ _("Use your browser location to find nearby care access points.") }}
+              {{ _("Use your browser location to explore nearby repair-service categories.") }}
             </p>
             <label
               style="
@@ -267,10 +256,10 @@
               "
             >
               <input type="checkbox" id="ayushmanOnly" />
-              {{ _("Prioritize public-care listings") }}
+              {{ _("Prioritize independent technicians") }}
             </label>
             <button class="send-button" type="button" id="findHospitalsBtn">
-              {{ _("Search care access") }}
+              {{ _("Discover technicians") }}
             </button>
             <div
               id="hospitalList"
@@ -289,7 +278,7 @@
             "
           >
             <h2 style="margin-bottom: 2rem; color: var(--text)">
-              {{ _("Scan History") }}
+              {{ _("Repair history") }}
             </h2>
             {% if scans and scans|length > 0 %}
             <ul style="list-style: none; padding: 0">
@@ -306,16 +295,16 @@
                 <em>{{ scan.timestamp }}</em><br />
                 {% if scan.flagged and scan.flagged != '{}' %}
                 <span style="color: #b91c1c; font-weight: bold"
-                  >{{ _("Overbilling detected") }}</span
+                  >{{ _("Quote needs review") }}</span
                 >
                 {% else %}
-                <span style="color: #047857">{{ _("No overbilling detected") }}</span>
+                <span style="color: #047857">{{ _("Repair plan ready") }}</span>
                 {% endif %}
                 <div style="margin-top: 0.5rem">
                   <a
                     href="/result/{{ scan.id }}"
                     style="font-weight: bold; color: #2d7ae0"
-                    >{{ _("View detailed bill analysis") }}</a
+                    >{{ _("Open repair plan") }}</a
                   >
                 </div>
               </li>
@@ -323,7 +312,7 @@
             </ul>
             {% else %}
             <p class="empty-state">
-              {{ _("Your scan history will appear here once you start scanning documents.") }}
+              {{ _("Your repair requests will appear here once you create your first brief.") }}
             </p>
             {% endif %}
           </div>
@@ -586,7 +575,7 @@
         hospitalSearchFailed: "{{ _('Hospital search failed.') }}",
         hospitalSearchUnavailable: "{{ _('Hospital search is temporarily unavailable.') }}",
         locationDenied: "{{ _('Location access denied. Enable location permission to search nearby hospitals.') }}",
-        appName: "{{ _('Nivara') }}",
+        appName: "{{ _('KaamPakka') }}",
         enterEmail: "{{ _('Please enter your email.') }}",
         sendingOtp: "{{ _('Sending OTP…') }}",
         networkError: "{{ _('Network error. Please try again.') }}",

@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="csrf-token" content="{{ csrf_token() }}" />
-    <title>{{ _("Nivara - Care assistant") }}</title>
+    <title>{{ _("KaamPakka - Purchase assistant") }}</title>
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="{{ url_for('static', filename='styles/chatbot.css') }}" />
     <style>
@@ -56,12 +56,12 @@
   <body>
     <div id="chatbox">
       <div class="topbar">
-        <h2>{% if lang == 'hi' %}आयु — आपका केयर को-पायलट{% else %}Ayu — your care co-pilot{% endif %}</h2>
+        <h2>{% if lang == 'hi' %}निया — आपकी खरीदारी को-पायलट{% else %}Nia — your purchase co-pilot{% endif %}</h2>
         <a href="/dashboard">{{ _("Back to Dashboard") }}</a>
       </div>
 
       <div class="mode-buttons">
-        <button class="mode-btn" type="button" onclick="setMode('price')">{{ _("Medicine Price") }}</button>
+        <button class="mode-btn" type="button" onclick="setMode('price')">{{ _("Compare offers") }}</button>
         <button class="mode-btn selected" type="button" onclick="setMode('gemini')">{{ _("Ask AI") }}</button>
         <button class="secondary" type="button" id="listenBtn">&#127908; {{ _("Listen") }}</button>
         <button class="secondary" type="button" id="speakToggle">&#128266; {{ _("Speech On") }}</button>
@@ -74,7 +74,7 @@
       </div>
 
       <div id="messages" class="history">
-        <div class="message bot">{% if lang == 'hi' %}नमस्ते। मैं आपके बिल, दवाओं की कीमत और बेहतर केयर प्लान को समझने में मदद करूँगी।{% else %}Hi. I can help you understand a bill, compare medicine prices, and prepare for a clearer care plan.{% endif %}</div>
+        <div class="message bot">{% if lang == 'hi' %}नमस्ते। मैं व्यापारी ऑफर, डिलीवरी के विकल्प और PayPal चेकआउट से पहले क्या जांचना है, इसमें मदद कर सकती हूं।{% else %}Hi. I can help you compare merchant offers, weigh delivery trade-offs, and know what to check before PayPal checkout.{% endif %}</div>
         {% for item in history %}
           <div class="message user">{{ item.user_message }}</div>
           <div class="message bot">{{ item.bot_response }}</div>

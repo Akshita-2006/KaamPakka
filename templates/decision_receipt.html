@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="{{ lang }}">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>KaamPakka | Decision receipt</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles/decision_receipt.css') }}" />
+  </head>
+  <body>
+    <main class="receipt">
+      <header><a href="{{ url_for('care_plan', scan_id=scan_id) }}" class="brand"><img src="{{ url_for('static', filename='images/kaampakka-mark.svg') }}" alt="" /> KAAMPAKKA</a><span>DECISION RECEIPT / {{ payment.id }}</span></header>
+      <section class="hero"><div><p>{% if is_demo_preview %}DEMO BOOKING PREVIEW{% else %}HUMAN-APPROVED LOCAL COMMERCE{% endif %}</p><h1>The decision is<br /><em>recorded.</em></h1><span class="status">{{ payment.status }}</span></div><aside><span>{% if is_demo_preview %}ESTIMATED BOOKING AMOUNT{% else %}PAYMENT AMOUNT{% endif %}</span><strong>{{ payment.currency }} {{ '%.2f'|format(payment.amount) }}</strong><small>{{ payment.created_at }}</small></aside></section>
+      <section class="ledger"><div class="ledger-head"><div><p>01 / PURCHASE BRIEF</p><h2>What KaamPakka used</h2></div><span>{{ scan.filename }}</span></div><div class="rows">{% for item in plan.get('items', []) %}<div><b>{{ item.name }}</b><span>{{ item.confidence|upper }} CONFIDENCE</span><span>₹{{ '%.2f'|format(item.recommended_amount) }}</span></div>{% else %}<p>No retained item detail is available for this receipt.</p>{% endfor %}</div><p class="safety">The buyer should verify final price, stock, fulfilment, and return terms with the selected merchant.</p></section>
+      <section class="split"><article><p>02 / TECHNICIAN CHOICE</p><h2>{{ payment.merchant_name or 'Demo technician' }}</h2>{% if merchant %}<span>{{ merchant.tagline }} · {{ merchant.eta }}</span>{% endif %}<small>Demo technician option selected by the buyer before booking.</small></article><article><p>03 / PAYPAL {% if is_demo_preview %}PREVIEW{% else %}PROOF{% endif %}</p><h2>{% if is_demo_preview %}No payment created{% else %}Payment captured{% endif %}</h2><span>{% if is_demo_preview %}Connect Sandbox credentials to create a real test order.{% else %}Order {{ payment.paypal_order_id }}{% endif %}</span>{% if payment.capture_id %}<small>Capture {{ payment.capture_id }}</small>{% endif %}</article></section>
+      <section class="why"><p>WHY THIS MATTERS</p><div><strong>AI prepared the comparison.</strong><strong>You selected the merchant.</strong><strong>PayPal executed the approved payment.</strong></div></section>
+      <footer><a href="{{ url_for('care_plan', scan_id=scan_id) }}">← Return to purchase route</a><span>NOT A LIVE INVENTORY OR DELIVERY GUARANTEE</span></footer>
+    </main>
+  </body>
+</html>

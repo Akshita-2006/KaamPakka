@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="csrf-token" content="{{ csrf_token() }}" />
-    <title>{{ _("Nivara - Create account") }}</title>
+    <title>{{ _("KaamPakka - Create account") }}</title>
     <link
       href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap"
       rel="stylesheet"
@@ -18,13 +18,13 @@
   </head>
   <body>
     <div class="container">
-      <a class="auth-brand" href="{{ url_for('index') }}"><img src="{{ url_for('static', filename='images/nivara-mark.svg') }}" alt="" />NIVARA</a>
+      <a class="auth-brand" href="{{ url_for('index') }}"><img src="{{ url_for('static', filename='images/kaampakka-mark.svg') }}" alt="" />KAAMPAKKA</a>
       <div class="header">
         <div class="title">
-          {{ _("Join Nivara") }}
+          {{ _("Join KaamPakka") }}
         </div>
         <div class="subtitle">
-          {{ _("Create your account to get started") }}
+          {{ _("Choose how you will use KaamPakka") }}
         </div>
       </div>
 
@@ -77,6 +77,12 @@
             <span class="input-icon">👤</span>
           </div>
         </div>
+
+        <fieldset class="role-picker">
+          <legend>I am joining as</legend>
+          <label class="role-option selected"><input type="radio" name="accountRole" value="customer" checked /><span><b>Homeowner / customer</b><small>Create repair requests and approve bookings.</small></span></label>
+          <label class="role-option"><input type="radio" name="accountRole" value="technician" /><span><b>Technician / service business</b><small>Open the technician desk and set up a service profile.</small></span></label>
+        </fieldset>
 
         <div class="form-group">
           <label class="form-label" for="email">

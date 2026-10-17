@@ -170,7 +170,7 @@ def check_rate_limit(key: str, max_requests: int = 5, window_sec: int = 60) -> b
     return True
 
 # ── Allowed upload extensions ─────────────────────────────────────────────────
-_ALLOWED_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp", ".pdf"})
+_ALLOWED_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp", ".pdf", ".txt"})
 
 _gemini_client = None
 _paypal_access_token = None
@@ -325,6 +325,7 @@ def init_db():
                 email TEXT NOT NULL UNIQUE,
                 password TEXT NOT NULL,
                 preferred_language TEXT DEFAULT 'en',
+                account_role TEXT DEFAULT 'customer',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -385,12 +386,28 @@ def init_db():
                 FOREIGN KEY (scan_id) REFERENCES scans(id) ON DELETE CASCADE
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS merchant_applications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL UNIQUE,
+                business_name TEXT NOT NULL,
+                business_type TEXT NOT NULL,
+                city TEXT NOT NULL,
+                contact_email TEXT NOT NULL,
+                fulfilment_note TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'DEMO_READY',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
 
         migrations = {
             "users": {
                 "preferred_language": "ALTER TABLE users ADD COLUMN preferred_language TEXT DEFAULT 'en'",
                 "created_at": "ALTER TABLE users ADD COLUMN created_at DATETIME",
                 "state": "ALTER TABLE users ADD COLUMN state TEXT",
+                "account_role": "ALTER TABLE users ADD COLUMN account_role TEXT DEFAULT 'customer'",
                 "caste_category": "ALTER TABLE users ADD COLUMN caste_category TEXT DEFAULT 'general'",
                 "annual_income": "ALTER TABLE users ADD COLUMN annual_income TEXT DEFAULT 'not_specified'",
             },
@@ -418,6 +435,7 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_user_timestamp ON chat_history(user_id, timestamp DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_otp_email_purpose ON otp_tokens(email, purpose, used)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_payment_orders_user_scan ON payment_orders(user_id, scan_id, created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_merchant_applications_user ON merchant_applications(user_id)")
 
         # Normalize legacy preferred_language values ('english'/'hindi'/'hinglish') to Babel locale codes.
         conn.execute("UPDATE users SET preferred_language = 'en' WHERE preferred_language = 'english'")
@@ -426,8 +444,88 @@ def init_db():
         conn.commit()
 
 
+def analyze_repair_brief(text):
+    """Create a transparent, generic repair-quote brief from uploaded text.
+
+    This intentionally avoids medical/catalog matching.  It extracts service or
+    part lines and their visible amounts so the customer can review a repair
+    quote before choosing a technician.
+    """
+    cleaned = clean_ocr_text(text or "")
+    items = []
+    amount_pattern = re.compile(r"(?:₹|rs\.?|inr)\s*([\d,]+(?:\.\d{1,2})?)|\b([\d,]+(?:\.\d{1,2})?)\s*(?:₹|rs\.?|inr)\b", re.I)
+    for raw_line in cleaned.splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip(" -:|")
+        match = amount_pattern.search(line)
+        if not match:
+            continue
+        amount_text = (match.group(1) or match.group(2) or "").replace(",", "")
+        try:
+            amount = round(float(amount_text), 2)
+        except ValueError:
+            continue
+        if amount <= 0:
+            continue
+        name = amount_pattern.sub("", line).strip(" -:|") or "Repair line item"
+        name = re.sub(r"\b(?:qty|quantity)\s*\d+\b", "", name, flags=re.I).strip(" -:|")
+        if len(name) < 2:
+            continue
+        items.append({
+            "name": name[:120], "category": "Repair service", "quantity": 1,
+            "quantity_display": "1", "quantity_detail": "Quoted line item",
+            "line_total": amount, "billed_price": amount, "billed_display": f"₹{amount:.2f}",
+            "expected_line_total": amount, "expected_display": f"₹{amount:.2f}",
+            "difference": 0.0, "confidence_tier": "medium", "combined_confidence": 0.72,
+            "reason": "Amount read from the uploaded repair quote.",
+        })
+    # A text-only brief is still useful in the demo: represent the request as
+    # a reviewable diagnostic visit rather than fabricating a parts price.
+    if not items and cleaned:
+        summary = cleaned.replace("\n", " ")[:110].strip()
+        items = [{
+            "name": summary or "Technician diagnostic visit", "category": "Service request", "quantity": 1,
+            "quantity_display": "1", "quantity_detail": "Price to be confirmed by technician",
+            "line_total": 299.0, "billed_price": 299.0, "billed_display": "₹299.00 estimated visit fee",
+            "expected_line_total": 299.0, "expected_display": "₹299.00", "difference": 0.0,
+            "confidence_tier": "medium", "combined_confidence": 0.60,
+            "reason": "Diagnostic visit created from the repair request.",
+        }]
+    total = round(sum(float(item["line_total"]) for item in items), 2)
+    return {}, {
+        "domain": "repair", "parse_source": "repair_quote_reader", "detected_items": items[:10],
+        "summary": {"total_detected": len(items), "estimated_savings": 0, "overpriced_count": 0},
+        "low_confidence_items": 0,
+    }
+
+
+def apply_repair_brief_inputs(report, user_items):
+    """Apply customer-confirmed quantities without changing a provider's quote."""
+    items = report.get("detected_items", [])
+    for entry in user_items:
+        index = entry["index"]
+        if index >= len(items):
+            continue
+        try:
+            quantity = max(0.01, min(float(entry.get("quantity") or 1), 99))
+        except (TypeError, ValueError):
+            quantity = 1
+        item = items[index]
+        previous_quantity = max(float(item.get("quantity") or 1), 0.01)
+        unit_price = float(item.get("line_total") or 0) / previous_quantity
+        item["quantity"] = quantity
+        item["quantity_display"] = f"{quantity:g}"
+        item["line_total"] = round(unit_price * quantity, 2)
+        item["billed_price"] = item["line_total"]
+        item["expected_line_total"] = item["line_total"]
+        item["billed_display"] = f"₹{item['line_total']:.2f}"
+        item["expected_display"] = f"₹{item['line_total']:.2f}"
+    report.setdefault("summary", {})["total_detected"] = len(items)
+    report["summary"]["estimated_savings"] = 0
+    return {}, report
+
+
 def build_care_plan(report):
-    """Turn existing bill analysis into a conservative, user-reviewable care basket."""
+    """Turn a reviewed repair brief into a user-approved booking basket."""
     eligible_items = []
     for item in report.get("detected_items", []):
         if item.get("confidence_tier") == "low":
@@ -440,13 +538,13 @@ def build_care_plan(report):
         if original <= 0 or recommended <= 0:
             continue
         eligible_items.append({
-            "name": str(item.get("name") or "Medicine")[:120],
+            "name": str(item.get("name") or "Requested item")[:120],
             "quantity": max(1, min(int(float(item.get("quantity") or 1)), 99)),
             "original_amount": round(original, 2),
             "recommended_amount": round(recommended, 2),
             "savings": round(max(original - recommended, 0), 2),
             "confidence": item.get("confidence_tier", "medium"),
-            "reason": str(item.get("jan_aushadhi_note") or "Reference-priced medicine option")[:240],
+            "reason": str(item.get("jan_aushadhi_note") or "Comparable merchant option")[:240],
         })
     total_original = round(sum(item["original_amount"] for item in eligible_items), 2)
     total_recommended = round(sum(item["recommended_amount"] for item in eligible_items), 2)
@@ -456,19 +554,17 @@ def build_care_plan(report):
         "recommended_total": total_recommended,
         "estimated_savings": round(max(total_original - total_recommended, 0), 2),
         "requires_review": True,
-        "disclaimer": (
-            "This is a price-comparison plan, not a prescription or medical recommendation. "
-            "Confirm availability, substitution suitability, and final price with a licensed provider before paying."
-        ),
+        "repair_preferences": report.get("repair_preferences", {}),
+        "disclaimer": "This is a demo comparison route. Confirm availability, final price, delivery terms, and return policy with the merchant before paying.",
     }
 
 
 # Demo merchants are deliberately local application data: they make the prototype's
-# marketplace decision visible without pretending that an un-onboarded pharmacy is real.
+# marketplace decision visible without pretending that an un-onboarded seller is live.
 DEMO_MERCHANTS = (
-    {"id": "healthbridge", "name": "HealthBridge Pharmacy", "tagline": "Best balance", "eta": "45–60 min", "multiplier": 1.00, "accent": "balance"},
-    {"id": "carecart", "name": "CareCart Wellness", "tagline": "Fastest delivery", "eta": "20–30 min", "multiplier": 1.06, "accent": "fast"},
-    {"id": "jancare", "name": "JanCare Direct", "tagline": "Lowest basket", "eta": "75–90 min", "multiplier": 0.94, "accent": "value"},
+    {"id": "local-loop", "name": "FixPro Home Services", "tagline": "Best balance · 30-day work warranty", "eta": "Today, 4–6 pm", "multiplier": 1.00, "accent": "balance"},
+    {"id": "swift-supply", "name": "RapidRoot Repairs", "tagline": "Fastest arrival · 15-min ETA", "eta": "Today, 90 min", "multiplier": 1.06, "accent": "fast"},
+    {"id": "value-street", "name": "SteadyHand Local", "tagline": "Lowest visit fee · parts pre-approved", "eta": "Tomorrow, 10–12", "multiplier": 0.94, "accent": "value"},
 )
 
 
@@ -487,10 +583,10 @@ def build_marketplace_offers(plan):
             "savings_vs_bill": round(max(plan.get("original_total", 0) - total, 0), 2),
             "reason": (
                 "Recommended for the best price-to-speed balance."
-                if merchant["id"] == "healthbridge" else
-                "Recommended when getting the basket sooner matters most."
-                if merchant["id"] == "carecart" else
-                "Recommended when minimizing the medicine basket total matters most."
+                if merchant["id"] == "local-loop" else
+                "Recommended when the earliest technician arrival matters most."
+                if merchant["id"] == "swift-supply" else
+                "Recommended when the lowest visit fee matters most."
             ),
             "demo": True,
         })
@@ -755,16 +851,14 @@ def find_medicine_price(query):
 def fallback_chat_response(message, language="english", mode="gemini"):
     text = (message or "").lower()
     if mode == "price":
-        return translate_reply("I could not find an exact medicine match. Try the generic name with strength, for example Paracetamol 500 mg.", language)
-    if "ayushman" in text or "pmjay" in text:
-        return "Ayushman Bharat PM-JAY coverage depends on the hospital empanelment and treatment package. Use the hospital filter to find likely empanelled hospitals nearby."
-    if "bill" in text or "price" in text or "mrp" in text:
-        return "Upload the bill in the scanner to compare detected prices with the Janaushadhi reference price. I can also explain individual charges here."
+        return translate_reply("I cannot verify a live market price in fallback mode. Compare the merchant offer, delivery window, and return terms before approving payment.", language)
+    if "delivery" in text or "merchant" in text or "price" in text:
+        return "Use KaamPakka to compare the offer price, fulfilment timing, and merchant promise. The final choice and PayPal approval stay with you."
     if language == "hindi":
-        return "मैं अभी सीमित मोड में जवाब दे रहा हूं। दवा, बिल, अस्पताल या आयुष्मान भारत से जुड़ा सवाल पूछें।"
+        return "मैं अभी सीमित मोड में जवाब दे रहा हूं। व्यापारी ऑफर, डिलीवरी, कीमत या PayPal चेकआउट के बारे में पूछें।"
     if language == "hinglish":
-        return "Main abhi fallback mode me hoon. Aap dawa, bill, hospital ya Ayushman Bharat ke baare me pooch sakte hain."
-    return "I am running in fallback mode right now. Ask about a medicine price, bill charge, hospital search, or Ayushman Bharat coverage."
+        return "Main abhi fallback mode me hoon. Aap merchant offer, delivery, price ya PayPal checkout ke baare me pooch sakte hain."
+    return "I am running in fallback mode right now. Ask about merchant offers, delivery, pricing, or PayPal checkout."
 
 
 def get_user_scan_context(user_id, limit=5):
@@ -880,18 +974,13 @@ def ask_gemini(message: str, language: str, user_id: int = None) -> str:
             context_block += f"\nRecent chat history:\n{context['chat_context']}\n"
     prompt = (
         f"{instruction}\n\n"
-        "You are Nia, Nivara's care-commerce assistant — warm, professional, and reassuring, "
-        "like a knowledgeable Indian hospital help-desk staffer, never robotic or overly formal. "
-        "Do not diagnose. Explain bills, medicine pricing, Jan Aushadhi comparisons, "
-        "PM-JAY/Ayushman Bharat coverage, OCR scan results, and healthcare navigation safely. "
-        "If the user asks why a medicine was flagged, use the scan context when available. "
-        "Do not invent scan results, prices, or medical facts that are not in the context — "
-        "if you are not sure of something, say so plainly instead of guessing. "
-        "If the scan context includes an OCR quality note, gently suggest the user upload a clearer "
-        "photo of the bill for a more accurate comparison. "
-        "If the user asks about a medicine price, refer to the Janaushadhi dataset. "
-        "If you cannot find a match, say so and suggest the user try the generic name with strength. "
-        "Do not reference scan numbers in your response. "
+        "You are Nia, KaamPakka's local-commerce co-pilot — warm, practical, and concise. "
+        "Help users frame a purchase brief, compare merchant offers, understand delivery and fulfilment "
+        "trade-offs, and prepare for a user-approved PayPal checkout. Never claim that an offer, seller, "
+        "inventory level, price, or delivery commitment is verified unless it appears in the user context. "
+        "Never make a purchase or imply that the user has paid; only the user can approve checkout. "
+        "If information is missing, state what the buyer should verify with the merchant. "
+        "Do not reference scan numbers or medical topics. "
         "Keep replies short and to the point by default — expand only if the user asks for more detail. "
         "Use short bullet points when listing multiple items, prices, or steps; use plain sentences for "
         "quick answers. Never pad a reply with unnecessary paragraphs. "
@@ -934,7 +1023,7 @@ def upgrade_password_if_plaintext(conn, user_id, stored, candidate):
 
 def _email_from_address():
     sender_email = os.getenv("BREVO_SENDER_EMAIL")
-    sender_name = os.getenv("BREVO_SENDER_NAME", "Nivara")
+    sender_name = os.getenv("BREVO_SENDER_NAME", "KaamPakka")
     if not sender_email:
         return ""
     return f"{sender_name} <{sender_email}>"
@@ -954,7 +1043,7 @@ def _send_email_http(to_email, subject, body):
         raise RuntimeError("BREVO_API_KEY is required")
 
     sender_email = os.getenv("BREVO_SENDER_EMAIL")
-    sender_name = os.getenv("BREVO_SENDER_NAME", "Nivara")
+    sender_name = os.getenv("BREVO_SENDER_NAME", "KaamPakka")
     if not sender_email:
         raise RuntimeError("BREVO_SENDER_EMAIL is required")
 
@@ -999,11 +1088,11 @@ def send_email(to_email, subject, body):
 
 def send_otp_email(email, otp, purpose="forgot_password"):
     body = _(
-        "Your Nivara OTP for %(purpose)s is %(otp)s. It is valid for this session.",
+        "Your KaamPakka OTP for %(purpose)s is %(otp)s. It is valid for this session.",
         purpose=purpose.replace('_', ' '), otp=otp,
     )
     try:
-        provider = send_email(email, _("Your Nivara OTP"), body)
+        provider = send_email(email, _("Your KaamPakka OTP"), body)
         app.logger.info("OTP email sent via %s", provider)
         return True, _("OTP sent to your email.")
     except Exception as exc:
@@ -2563,7 +2652,7 @@ def api_email_status():
         "brevo_api_key_hint": f"{brevo_key[:4]}...{brevo_key[-4:]}" if len(brevo_key) >= 8 else "not set",
         "brevo_sender_email_set": bool(sender_email),
         "brevo_sender_email": sender_email,
-        "brevo_sender_name": os.getenv("BREVO_SENDER_NAME", "Nivara"),
+        "brevo_sender_name": os.getenv("BREVO_SENDER_NAME", "KaamPakka"),
         "contact_email_set": bool(contact_email),
         "contact_email": contact_email,
         "email_reply_to_set": bool(os.getenv("EMAIL_REPLY_TO")),
@@ -2594,7 +2683,7 @@ def contact():
     try:
         send_email(
             contact_to,
-            f"Nivara Contact - {name}",
+            f"KaamPakka Contact - {name}",
             f"Name: {name}\nEmail: {email}\n\nMessage:\n{message}",
         )
         app.logger.info("Contact form submitted from %s", email)
@@ -2614,10 +2703,13 @@ def signup():
     required = ["firstName", "lastName", "username", "email", "password"]
     if not all(data.get(field) for field in required):
         return jsonify(success=False, message=_("Please fill all required fields.")), 400
+    account_role = str(data.get("accountRole") or "customer").strip().lower()
+    if account_role not in {"customer", "technician"}:
+        account_role = "customer"
     try:
         with get_db_connection() as conn:
             cursor = conn.execute(
-                "INSERT INTO users (first_name, last_name, username, email, password, preferred_language) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO users (first_name, last_name, username, email, password, preferred_language, account_role) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     data["firstName"].strip(),
                     data["lastName"].strip(),
@@ -2625,11 +2717,12 @@ def signup():
                     data["email"].strip().lower(),
                     generate_password_hash(data["password"]),
                     normalize_locale(session.get("language")),
+                    account_role,
                 ),
             )
             conn.commit()
             session["user_id"] = cursor.lastrowid
-        return jsonify(success=True, redirect_url="/dashboard")
+        return jsonify(success=True, redirect_url="/merchant-workspace" if account_role == "technician" else "/dashboard")
     except sqlite3.IntegrityError:
         return jsonify(success=False, message=_("Email or username already registered.")), 409
     except sqlite3.Error as exc:
@@ -2704,10 +2797,15 @@ def dashboard():
 
 @app.route("/merchant-workspace")
 def merchant_workspace():
-    """Demo merchant view: the marketplace side of Nivara's agentic workflow."""
+    """Demo merchant view: the marketplace side of KaamPakka's agentic workflow."""
     if "user_id" not in session:
         return redirect(url_for("login"))
     with get_db_connection() as conn:
+        application = conn.execute(
+            "SELECT business_name, business_type, city, contact_email, fulfilment_note, status, created_at "
+            "FROM merchant_applications WHERE user_id = ?",
+            (session["user_id"],),
+        ).fetchone()
         rows = conn.execute(
             "SELECT merchant_name, status, amount, currency, created_at FROM payment_orders "
             "WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
@@ -2727,7 +2825,36 @@ def merchant_workspace():
             "grossValue": gross_value,
             "readiness": "Checkout ready",
         })
-    return render_template("merchant_workspace.html", merchant_rows=merchant_rows)
+    return render_template("merchant_workspace.html", merchant_rows=merchant_rows, application=application)
+
+
+@app.route("/merchant/apply", methods=["POST"])
+def merchant_apply():
+    """Capture a demo merchant application; this is not PayPal seller onboarding."""
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+    fields = {
+        "business_name": (request.form.get("business_name") or "").strip()[:120],
+        "business_type": (request.form.get("business_type") or "").strip()[:80],
+        "city": (request.form.get("city") or "").strip()[:80],
+        "contact_email": (request.form.get("contact_email") or "").strip().lower()[:200],
+        "fulfilment_note": (request.form.get("fulfilment_note") or "").strip()[:500],
+    }
+    if not all(fields.values()) or "@" not in fields["contact_email"]:
+        flash("Complete every merchant application field with a valid email.", "danger")
+        return redirect(url_for("merchant_workspace"))
+    with get_db_connection() as conn:
+        conn.execute(
+            "INSERT INTO merchant_applications (user_id, business_name, business_type, city, contact_email, fulfilment_note, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'DEMO_READY') "
+            "ON CONFLICT(user_id) DO UPDATE SET business_name=excluded.business_name, business_type=excluded.business_type, "
+            "city=excluded.city, contact_email=excluded.contact_email, fulfilment_note=excluded.fulfilment_note, "
+            "status='DEMO_READY', updated_at=CURRENT_TIMESTAMP",
+            (session["user_id"], fields["business_name"], fields["business_type"], fields["city"], fields["contact_email"], fields["fulfilment_note"]),
+        )
+        conn.commit()
+    flash("Merchant profile saved. Your demo workspace is ready.", "success")
+    return redirect(url_for("merchant_workspace"))
 
 
 @app.route("/chatbot")
@@ -2845,13 +2972,16 @@ def scan():
     # Extension whitelist
     suffix = Path(secure_filename(file.filename)).suffix.lower()
     if suffix not in _ALLOWED_EXTENSIONS:
-        return jsonify(success=False, message=_("Unsupported file type. Please upload a JPG, PNG, or PDF.")), 400
+        return jsonify(success=False, message=_("Unsupported file type. Please upload a JPG, PNG, PDF, or TXT quote.")), 400
 
     filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}_{secure_filename(file.filename)}"
     file_path = UPLOAD_FOLDER / filename
     file.save(file_path)
     try:
-        if file_path.suffix.lower() == ".pdf":
+        if file_path.suffix.lower() == ".txt":
+            text = file_path.read_text(encoding="utf-8", errors="replace")
+            scan_mode = "text_quote"
+        elif file_path.suffix.lower() == ".pdf":
             text, scan_mode = extract_pdf_text(file_path)
             if not text:
                 if pytesseract is None or Image is None:
@@ -2872,7 +3002,7 @@ def scan():
             text = ocr_image_to_text(image)
             scan_mode = "image"
         ocr_quality = estimate_ocr_quality(text)
-        _flagged, report = analyze_bill(text)
+        _flagged, report = analyze_repair_brief(text)
         report.setdefault("summary", {})["ocr_quality"] = ocr_quality
         review_id = uuid.uuid4().hex
         _pending_scan_store[review_id] = {
@@ -2888,7 +3018,7 @@ def scan():
             success=True,
             review_required=True,
             review_url=url_for("review_scan", review_id=review_id),
-            message=_("OCR extraction complete. Please confirm quantities before analysis."),
+            message=_("Repair brief read. Please confirm the quoted items before requesting a technician."),
             report=report,
             text=text,
             scan_mode=scan_mode,
@@ -2931,9 +3061,25 @@ def review_scan(review_id):
             "index": index,
             "quantity": request.form.get(f"quantity_{index}"),
         })
-    hospital_type = request.form.get("hospital_type", "private")
-    flagged, report = apply_user_pricing_inputs(report, user_items, hospital_type)
-    illness, covered, _gemini_analysis = gemini_bill_context(pending.get("text", ""))
+    if report.get("domain") == "repair":
+        def bounded_amount(field, ceiling=100000):
+            try:
+                return round(max(0, min(float(request.form.get(field) or 0), ceiling)), 2)
+            except (TypeError, ValueError):
+                return 0
+        report["repair_preferences"] = {
+            "service_type": (request.form.get("service_type") or "General repair").strip()[:80],
+            "urgency": (request.form.get("urgency") or "Flexible").strip()[:40],
+            "visit_window": (request.form.get("visit_window") or "No preference").strip()[:100],
+            "budget": bounded_amount("budget"),
+            "parts_cap": bounded_amount("parts_cap"),
+        }
+        flagged, report = apply_repair_brief_inputs(report, user_items)
+        illness, covered = "Repair request", "Quote review required"
+    else:
+        hospital_type = request.form.get("hospital_type", "private")
+        flagged, report = apply_user_pricing_inputs(report, user_items, hospital_type)
+        illness, covered, _gemini_analysis = gemini_bill_context(pending.get("text", ""))
     savings = report["summary"]["estimated_savings"]
 
     with get_db_connection() as conn:
@@ -3002,7 +3148,7 @@ def care_plan(scan_id):
             (scan_id, session["user_id"]),
         ).fetchone()
         payments = conn.execute(
-            "SELECT paypal_order_id, status, amount, currency, capture_id, merchant_name, created_at "
+            "SELECT id, paypal_order_id, status, amount, currency, capture_id, merchant_id, merchant_name, plan_json, created_at "
             "FROM payment_orders WHERE scan_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT 5",
             (scan_id, session["user_id"]),
         ).fetchall()
@@ -3024,6 +3170,69 @@ def care_plan(scan_id):
         paypal_currency=config["currency"],
         paypal_configured=paypal_is_configured(),
         paypal_environment=config["environment"],
+    )
+
+
+@app.route("/care-plan/<int:scan_id>/decision-receipt/<int:payment_id>")
+def decision_receipt(scan_id, payment_id):
+    """Human-readable proof of the agent's recommendation and the user's payment decision."""
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+    with get_db_connection() as conn:
+        payment = conn.execute(
+            "SELECT id, paypal_order_id, status, amount, currency, capture_id, merchant_id, merchant_name, plan_json, created_at "
+            "FROM payment_orders WHERE id = ? AND scan_id = ? AND user_id = ?",
+            (payment_id, scan_id, session["user_id"]),
+        ).fetchone()
+        scan = conn.execute(
+            "SELECT filename, timestamp FROM scans WHERE id = ? AND user_id = ?",
+            (scan_id, session["user_id"]),
+        ).fetchone()
+    if not payment or not scan:
+        flash(_("Decision receipt not found."), "danger")
+        return redirect(url_for("dashboard"))
+    try:
+        plan = json.loads(payment["plan_json"] or "{}")
+    except json.JSONDecodeError:
+        plan = {"items": [], "estimated_savings": 0, "original_total": 0}
+    merchant = next((item for item in DEMO_MERCHANTS if item["id"] == payment["merchant_id"]), None)
+    return render_template(
+        "decision_receipt.html",
+        scan_id=scan_id,
+        payment=payment,
+        scan=scan,
+        plan=plan,
+        merchant=merchant,
+    )
+
+
+@app.route("/care-plan/<int:scan_id>/demo-receipt")
+def demo_receipt(scan_id):
+    """Render a non-payment receipt so the complete prototype can be reviewed without PayPal credentials."""
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+    with get_db_connection() as conn:
+        scan = conn.execute(
+            "SELECT filename, report FROM scans WHERE id = ? AND user_id = ?",
+            (scan_id, session["user_id"]),
+        ).fetchone()
+    if not scan:
+        flash("Repair request not found.", "danger")
+        return redirect(url_for("dashboard"))
+    try:
+        report = json.loads(scan["report"] or "{}")
+    except json.JSONDecodeError:
+        report = {}
+    plan = build_care_plan(report)
+    merchant = get_marketplace_offer(plan, "local-loop") or {"name": "FixPro Home Services", "tagline": "Demo technician", "eta": "Today"}
+    payment = {
+        "id": "DEMO-BOOKING", "status": "DEMO PREVIEW — NOT PAID", "currency": paypal_config().get("currency", "INR"),
+        "amount": merchant.get("total", plan.get("recommended_total", 0)), "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "paypal_order_id": "Not created", "capture_id": None, "merchant_name": merchant.get("name"),
+    }
+    return render_template(
+        "decision_receipt.html", payment=payment, plan=plan, scan={"filename": scan["filename"]},
+        scan_id=scan_id, merchant=merchant, is_demo_preview=True,
     )
 
 
@@ -3065,8 +3274,8 @@ def create_paypal_order(scan_id):
     order_payload = {
         "intent": "CAPTURE",
         "purchase_units": [{
-            "reference_id": f"NIVARA-{scan_id}",
-            "description": f"Nivara care plan · {selected_merchant['name']}",
+            "reference_id": f"KAAMPAKKA-{scan_id}",
+            "description": f"KaamPakka care plan · {selected_merchant['name']}",
             "custom_id": f"scan:{scan_id};user:{session['user_id']}",
             "amount": {
                 "currency_code": config["currency"],
@@ -3149,7 +3358,7 @@ def export_scan_csv(scan_id):
     report = json.loads(row["report"] or "{}")
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow([_("Nivara Care Evidence Report")])
+    writer.writerow([_("KaamPakka Care Evidence Report")])
     writer.writerow([_("File"), row["filename"]])
     writer.writerow([_("Date"), row["timestamp"]])
     if row["illness"] and row["illness"] != "N/A":
@@ -3183,7 +3392,7 @@ def export_scan_csv(scan_id):
     return Response(
         buf.getvalue(),
         mimetype="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=nivara_care_evidence_{scan_id}.csv"},
+        headers={"Content-Disposition": f"attachment; filename=kaampakka_repair_evidence_{scan_id}.csv"},
     )
 
 
@@ -3208,7 +3417,7 @@ def export_scan_pdf(scan_id):
     styles = getSampleStyleSheet()
     green = _rl_colors.HexColor("#2db646")
     elements = []
-    elements.append(Paragraph(_("Nivara — Care Evidence Report"), styles["Title"]))
+    elements.append(Paragraph(_("KaamPakka — Care Evidence Report"), styles["Title"]))
     elements.append(Spacer(1, 6))
     elements.append(Paragraph(_("<b>File:</b> %(filename)s", filename=row["filename"]), styles["Normal"]))
     elements.append(Paragraph(_("<b>Date:</b> %(timestamp)s", timestamp=row["timestamp"]), styles["Normal"]))
@@ -3266,7 +3475,7 @@ def export_scan_pdf(scan_id):
     return Response(
         buf.getvalue(),
         mimetype="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename=nivara_care_evidence_{scan_id}.pdf"},
+        headers={"Content-Disposition": f"attachment; filename=kaampakka_repair_evidence_{scan_id}.pdf"},
     )
 
 
@@ -3449,4 +3658,8 @@ init_db()
 
 
 if __name__ == "__main__":
-    app.run(debug=False)
+    # Keep the local development address deterministic.  Railway/Gunicorn imports
+    # ``app`` directly, so this is only used for ``python app.py`` on a laptop.
+    # Bind to all local interfaces so the server also works when it is started
+    # from an editor-integrated terminal and opened in the desktop browser.
+    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)

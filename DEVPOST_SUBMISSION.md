@@ -1,82 +1,32 @@
-# Nivara — Devpost submission kit
+# KaamPakka — AI-guided local commerce
 
-## One-line pitch
+## Inspiration
 
-Nivara is an AI-guided care marketplace that turns a medical bill into a transparent, user-approved care plan and PayPal checkout.
-
-## Project description
-
-People often have to pay for healthcare under pressure, without a clear way to understand a bill, compare lower-cost options, or see what happens before checkout. Nivara creates a decision layer before money moves.
-
-A user uploads a medical bill or prescription. OCR and Gemini-assisted analysis structure the evidence, while confidence guardrails prevent low-confidence items from entering a checkout-ready plan. Nivara presents the reviewed basket alongside transparent merchant offers: each offer shows its price, delivery promise, and trade-off. The user—not the AI—must select an offer and explicitly approve the plan. Only then does Nivara create and capture a PayPal Sandbox order.
-
-Nivara also includes a merchant workspace built with AG Grid. It makes marketplace offer performance, payment events, and fulfilment positioning inspectable rather than hidden behind an opaque ranking algorithm.
-
-This prototype demonstrates a safer version of agentic commerce: AI reduces research effort, but the human retains control over medical suitability, merchant choice, and payment approval.
+Buying from local merchants often means switching between chats, listings, delivery promises, and payment links. KaamPakka creates one deliberate decision moment before money moves.
 
 ## What it does
 
-- Reads medical bills and PDFs with OCR.
-- Uses Gemini-assisted analysis with a rule-based fallback.
-- Filters low-confidence items before they can enter checkout.
-- Builds a transparent care plan with reference-price savings.
-- Lets users compare demo merchant offers by price and delivery window.
-- Creates and captures PayPal Sandbox orders through server-side Orders v2 calls.
-- Records payment events and selected merchant in SQLite.
-- Provides an AG Grid merchant workspace for operational review.
-- Supports English and Hindi in the core product experience.
+KaamPakka turns a purchase brief, shopping list, or merchant quote into a reviewable route. Its AI co-pilot explains the trade-offs a buyer should check; the decision desk compares demo merchant offers on price and fulfilment speed; and the buyer explicitly selects an offer before PayPal Sandbox checkout starts. A merchant workspace demonstrates the other side of the flow: profile registration, offer operations, AG Grid review, and payment-event visibility.
 
-## Tools used
+## PayPal + AI
 
-- **PayPal Developer Platform:** JavaScript SDK and Orders v2 API for secure Sandbox checkout.
-- **Google Gemini:** turns OCR text into structured, cautious care evidence and supports the care assistant.
-- **Tesseract OCR / PDF extraction:** reads bills and prescriptions.
-- **AG Grid Community:** powers the interactive merchant operations table.
-- **Flask and SQLite:** application backend and prototype data storage.
+- **PayPal Orders v2:** server-side access token, order creation, buyer approval, and capture in Sandbox.
+- **Gemini:** conversational co-pilot for purchase briefs, offer comparison, fulfilment questions, and buyer checks.
+- **Human-in-the-loop agentic commerce:** AI researches and explains; it never selects a merchant or spends money on the buyer's behalf.
+- **Decision Receipt:** after a completed capture, the buyer receives an auditable record of the selected merchant, amount, and approval event.
+- **AG Grid:** merchant offer operations table for filtering, sorting, and inspecting marketplace data.
 
-## How PayPal is used
+## Demo flow (under 3 minutes)
 
-The browser never receives the PayPal client secret. Nivara's Flask backend obtains a PayPal access token, creates an order only after user acknowledgement, and captures it after PayPal approval. The app records the order status, capture ID, selected merchant, and care-plan context. The hackathon demo runs in PayPal Sandbox, so it does not process real money.
+1. Start at the KaamPakka landing page and state the problem: local buying is fragmented and opaque.
+2. Sign in, open the dashboard, and create a purchase brief by uploading a sample shopping list or merchant quote.
+3. Show the purchase route and explain the visible price / delivery trade-offs.
+4. Open Merchant workspace, register a demo merchant profile, and show the AG Grid operations view.
+5. Return to the route, choose an offer, acknowledge the terms, and complete a PayPal Sandbox checkout.
+6. Show the captured payment event and Decision Receipt.
 
-## Three-minute video outline
+## Important prototype boundaries
 
-**0:00–0:18 — Problem**
-
-“A healthcare bill is not a buying decision. People need a clear way to understand options before money moves.” Show Nivara landing page.
-
-**0:18–0:48 — AI evidence**
-
-Upload a prepared sample bill. Show OCR review and the resulting evidence page. Explain that low-confidence items are excluded from checkout.
-
-**0:48–1:30 — Agentic decision, with user control**
-
-Open the care plan. Compare merchant offers, point out price and delivery trade-offs, tick the acknowledgement. Say: “The agent prepares; the user chooses and approves.”
-
-**1:30–2:10 — PayPal proof**
-
-Click the PayPal Sandbox button, approve using a Sandbox buyer, and return to the recorded payment event. Explain that create and capture run server-side.
-
-**2:10–2:38 — Merchant workspace**
-
-Open Merchant workspace. Sort or filter the AG Grid table. Explain that the marketplace reasoning is visible to merchants and users rather than hidden.
-
-**2:38–3:00 — Impact and close**
-
-“Nivara makes care commerce calmer: AI explains the choice, PayPal handles the approved payment, and people stay in control.”
-
-## Demo safeguards to say aloud
-
-- The merchant offers are clearly labelled demo offers.
-- The payment runs against a configured PayPal Sandbox business account.
-- Nivara does not provide medical advice or automatically purchase medication.
-- Users must verify availability and clinical suitability with a qualified provider.
-
-## Repository checklist
-
-- [x] Clear setup and PayPal Sandbox instructions in README
-- [x] Functional prototype routes and error checks
-- [x] Explicit demo merchant and safety disclosures
-- [x] Video script under three minutes
-- [ ] Add an open-source license file before making the repository public
-- [ ] Add hosted demo URL to Devpost after deployment
-- [ ] Record and upload the public YouTube demo video
+- Merchant offers are simulated local-marketplace data for the demo; they are not live inventory or delivery commitments.
+- Checkout captures to the configured PayPal Sandbox business account. Real multi-seller payouts need PayPal partner onboarding.
+- AI provides decision support only. Buyers must verify final pricing, stock, fulfilment, and return terms with the merchant.

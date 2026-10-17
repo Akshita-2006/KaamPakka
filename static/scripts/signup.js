@@ -14,6 +14,7 @@ document.addEventListener("DOMContentLoaded", function () {
   const confirmToggleIcon = document.getElementById("confirmToggleIcon");
   const firstNameInput = document.getElementById("firstName");
   const lastNameInput = document.getElementById("lastName");
+  const roleInputs = document.querySelectorAll('input[name="accountRole"]');
   const CSRF_TOKEN = document.querySelector('meta[name="csrf-token"]').content;
 
   function togglePasswordVisibility(inputElement, iconElement) {
@@ -25,6 +26,11 @@ document.addEventListener("DOMContentLoaded", function () {
   passwordToggle.addEventListener("click", () =>
     togglePasswordVisibility(passwordInput, toggleIcon),
   );
+
+  roleInputs.forEach((input) => input.addEventListener("change", () => {
+    document.querySelectorAll(".role-option").forEach((option) => option.classList.remove("selected"));
+    input.closest(".role-option").classList.add("selected");
+  }));
   confirmPasswordToggle.addEventListener("click", () =>
     togglePasswordVisibility(confirmPasswordInput, confirmToggleIcon),
   );
@@ -96,6 +102,7 @@ document.addEventListener("DOMContentLoaded", function () {
           username: usernameInput.value.trim(),
           email: emailInput.value.trim(),
           password: passwordInput.value,
+          accountRole: document.querySelector('input[name="accountRole"]:checked')?.value || "customer",
         }),
       })
         .then((response) => response.json())

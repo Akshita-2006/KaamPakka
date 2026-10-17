@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Nivara | Merchant workspace</title>
+    <title>KaamPakka | Merchant workspace</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&family=Playfair+Display:ital,wght@0,500;1,500&display=swap" rel="stylesheet" />
@@ -13,10 +13,12 @@
   </head>
   <body>
     <main class="shell">
-      <nav><a class="brand" href="{{ url_for('dashboard') }}"><img src="{{ url_for('static', filename='images/nivara-mark.svg') }}" alt="" /> NIVARA</a><span>MERCHANT WORKSPACE · DEMO</span></nav>
-      <section class="hero"><div><p class="eyebrow">AGENTIC COMMERCE CONTROL LAYER</p><h1>Turn care intent into<br /><em>fulfillable demand.</em></h1><p>Nivara gives merchants a transparent view of approved care-plan demand. This demo uses simulated marketplace offers and your sandbox payment events only.</p></div><a class="back" href="{{ url_for('dashboard') }}">← Return to care workspace</a></section>
+      <nav><a class="brand" href="{{ url_for('dashboard') }}"><img src="{{ url_for('static', filename='images/kaampakka-mark.svg') }}" alt="" /> KAAMPAKKA</a><span>TECHNICIAN DESK · DEMO</span></nav>
+      <section class="hero"><div><p class="eyebrow">REPAIR-REQUEST CONTROL LAYER</p><h1>Turn a breakdown into<br /><em>a bookable job.</em></h1><p>KaamPakka gives technicians a transparent view of buyer-approved repair requests. This demo uses simulated technician offers and sandbox payment events only.</p></div><a class="back" href="{{ url_for('dashboard') }}">← Return to repair desk</a></section>
       <section class="metrics"><article><span>MERCHANTS</span><strong>3</strong><p>transparent offers</p></article><article><span>PAYMENT EVENTS</span><strong id="event-count">0</strong><p>from this account</p></article><article><span>PAYPAL MODE</span><strong>Sandbox</strong><p>safe demo checkout</p></article></section>
-      <section class="workspace"><div class="section-head"><div><p class="eyebrow">MARKETPLACE PERFORMANCE</p><h2>Offer operations</h2></div><p>Sort, filter, and inspect the merchant offer data. AG Grid makes the marketplace logic reviewable rather than hidden.</p></div><div id="merchantGrid" class="ag-theme-quartz" aria-label="Merchant marketplace operations table"></div></section>
+      {% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}<div class="flash-stack">{% for category, message in messages %}<p class="flash {{ category }}">{{ message }}</p>{% endfor %}</div>{% endif %}{% endwith %}
+      {% if application %}<section class="merchant-profile"><div><p class="eyebrow">YOUR MERCHANT PROFILE</p><h2>{{ application.business_name }}</h2><p>{{ application.business_type }} · {{ application.city }}</p></div><div class="merchant-status"><span>ONBOARDING STATUS</span><strong>{{ application.status|replace('_', ' ') }}</strong><p>Profile captured for the demo. Live seller payout onboarding needs PayPal platform approval.</p></div></section>{% else %}<section class="merchant-apply"><div><p class="eyebrow">JOIN THE MARKETPLACE</p><h2>Register a merchant profile.</h2><p>Show how an independent local seller can join KaamPakka. This creates a real in-app demo profile; it does not yet create a live PayPal seller account.</p></div><form action="{{ url_for('merchant_apply') }}" method="POST"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}" /><input name="business_name" placeholder="Business name" required /><select name="business_type" required><option value="">Business type</option><option>Grocery & essentials</option><option>Home & lifestyle</option><option>Specialty retailer</option><option>Local service</option></select><input name="city" placeholder="City" required /><input type="email" name="contact_email" placeholder="Business email" required /><textarea name="fulfilment_note" rows="2" placeholder="How will you fulfil customer orders?" required></textarea><button type="submit">Save merchant profile →</button></form></section>{% endif %}
+      <section class="workspace"><div class="section-head"><div><p class="eyebrow">MARKETPLACE PERFORMANCE</p><h2>Offer operations</h2></div><p>Sort, filter, and inspect the merchant offer data. AG Grid makes the marketplace logic reviewable rather than hidden.</p></div><div id="merchantGrid" class="ag-theme-quartz" aria-label="Merchant marketplace operations table"></div><div id="merchantFallback" class="merchant-fallback"><div class="fallback-head"><span>Merchant</span><span>Offer promise</span><span>Delivery</span><span>Orders</span><span>Sandbox GMV</span><span>Status</span></div>{% for row in merchant_rows %}<div class="fallback-row"><b>{{ row.merchant }}</b><span>{{ row.positioning }}</span><span>{{ row.deliveryWindow }}</span><span>{{ row.orders }}</span><span>₹{{ '%.2f'|format(row.grossValue) }}</span><em>{{ row.readiness }}</em></div>{% endfor %}</div></section>
       <section class="principles"><article><b>01</b><h3>User control</h3><p>An agent can prepare an option; only a user can approve and begin payment.</p></article><article><b>02</b><h3>Transparent ranking</h3><p>Price, speed, and positioning are visible before checkout—no black-box recommendation.</p></article><article><b>03</b><h3>Sandbox-safe</h3><p>Demo merchants are illustrative; payments go to the configured PayPal Sandbox business account.</p></article></section>
     </main>
     <script src="https://cdn.jsdelivr.net/npm/ag-grid-community/dist/ag-grid-community.min.js"></script>
@@ -41,7 +43,12 @@
         paginationPageSize: 10,
         theme: 'legacy'
       };
-      agGrid.createGrid(document.querySelector('#merchantGrid'), gridOptions);
+      if (window.agGrid && typeof agGrid.createGrid === 'function') {
+        agGrid.createGrid(document.querySelector('#merchantGrid'), gridOptions);
+        document.getElementById('merchantFallback').hidden = true;
+      } else {
+        document.getElementById('merchantGrid').hidden = true;
+      }
     </script>
   </body>
 </html>
